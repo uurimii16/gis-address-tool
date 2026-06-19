@@ -235,12 +235,24 @@ with st.container(border=True):
         want_pg = st.checkbox("필지 경계 레이어 — 실제 땅 모양·공시지가 포함 (느릴 수 있습니다)", value=True)
 
 # 4) 파일 업로드 + 열 확인
-uploaded = st.file_uploader("엑셀 파일(.xlsx)을 올려 주세요", type=["xlsx"])
+uploaded = st.file_uploader("엑셀 파일(.xlsx)을 올려 주세요  ·  주소가 담긴 가벼운 파일", type=["xlsx"])
 
 if uploaded:
-    wb = load_workbook(io.BytesIO(uploaded.getvalue()))
-    ws = wb.active
-    det = detect_layout(ws)
+    size_mb = (uploaded.size or 0) / 1_000_000
+    if size_mb > 8:
+        st.error(
+            f"파일이 너무 큽니다 (약 {size_mb:.0f}MB).\n\n"
+            "이 도구는 **주소 목록** 엑셀용이에요. 수십만 행·여러 시트짜리 큰 파일은 "
+            "무료 서버 한도를 넘어 멈출 수 있어, 처리를 막았습니다.\n\n"
+            "👉 주소가 담긴 시트만 남겨 가볍게(보통 몇 MB 이하) 만든 뒤 다시 올려 주세요.")
+        st.stop()
+    try:
+        wb = load_workbook(io.BytesIO(uploaded.getvalue()))
+        ws = wb.active
+        det = detect_layout(ws)
+    except Exception as e:
+        st.error(f"파일을 여는 중 문제가 발생했습니다.\n\n{type(e).__name__}: {e}")
+        st.stop()
 
     with st.container(border=True):
         st.markdown("##### 📋 주소 열 확인")
