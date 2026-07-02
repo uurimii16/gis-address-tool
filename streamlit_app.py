@@ -55,11 +55,21 @@ def _normalize(row_iter):
     return grid, truncated
 
 
-def read_xlsx_grid(file_bytes):
-    """엑셀을 read_only(스트리밍) 모드로 훑어 grid 로 변환. 통째로 메모리에 올리지 않아 큰 파일도 안전."""
+def xlsx_sheet_names(file_bytes):
+    """엑셀의 시트 이름 목록을 반환(가볍게 열고 닫음)."""
     wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     try:
-        return _normalize(wb.active.iter_rows(values_only=True))
+        return wb.sheetnames
+    finally:
+        wb.close()
+
+
+def read_xlsx_grid(file_bytes, sheet=None):
+    """엑셀의 지정 시트를 read_only(스트리밍) 모드로 훑어 grid 로 변환. sheet=None이면 첫(활성) 시트."""
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet] if (sheet and sheet in wb.sheetnames) else wb.active
+        return _normalize(ws.iter_rows(values_only=True))
     finally:
         wb.close()
 
@@ -298,6 +308,7 @@ uploaded = st.file_uploader(
 
 if uploaded:
     ext = uploaded.name.rsplit(".", 1)[-1].lower()
+    sheet_name = None
     size_mb = (uploaded.size or 0) / 1_000_000
     limit = CSV_SIZE_LIMIT_MB if ext == "csv" else XLSX_SIZE_LIMIT_MB
     if size_mb > limit:
@@ -323,9 +334,20 @@ if uploaded:
             st.caption(f"인코딩 자동 감지: **{used_enc}** · 한글이 깨지면 위에서 직접 선택해 주세요.")
     else:
         try:
-            grid, truncated = read_xlsx_grid(uploaded.getvalue())
+            sheets = xlsx_sheet_names(uploaded.getvalue())
         except Exception as e:
             st.error(f"파일을 여는 중 문제가 발생했습니다.\n\n{type(e).__name__}: {e}")
+            st.stop()
+        sheet_name = sheets[0] if sheets else None
+        if len(sheets) > 1:
+            sheet_name = st.selectbox(
+                f"📑 시트 선택 (총 {len(sheets)}개)", sheets,
+                help="엑셀에 시트가 여러 개입니다. 변환할 시트를 하나 고르세요. "
+                     "시트별로 골라 각각 변환·내려받기 하면 됩니다.")
+        try:
+            grid, truncated = read_xlsx_grid(uploaded.getvalue(), sheet_name)
+        except Exception as e:
+            st.error(f"시트를 여는 중 문제가 발생했습니다.\n\n{type(e).__name__}: {e}")
             st.stop()
 
     if truncated:
@@ -333,6 +355,7 @@ if uploaded:
                    "나머지 행은 파일을 나눠 다시 올려 주세요.")
 
     det = detect_layout(grid)
+    sig = f"{sheet_name or 'csv'}-{n_cols(grid)}"   # 시트/구조 바뀌면 열 선택 위젯을 새로 시작
 
     with st.container(border=True):
         st.markdown("##### 📋 주소 열 확인")
@@ -362,7 +385,7 @@ if uploaded:
             cc = st.columns(3); admin_cols = []
             for i in range(5):
                 dflt = i2o.get(admin_default[i], "(없음)") if i < len(admin_default) else "(없음)"
-                lab = cc[i % 3].selectbox(f"구성 {i+1}", opts, index=opts.index(dflt), key=f"adm{i}")
+                lab = cc[i % 3].selectbox(f"구성 {i+1}", opts, index=opts.index(dflt), key=f"adm{i}_{sig}")
                 if o2i[lab]:
                     admin_cols.append(o2i[lab])
             jkind = st.radio("지번 형태", ["한 칸 (71-2)", "본번·부번 분리"], horizontal=True)
@@ -478,7 +501,8 @@ if uploaded:
                                    "ok": ok, "fail": fail, "skip": skip}
         st.session_state.setdefault("history", []).insert(0, {
             "시각": datetime.now().strftime("%H:%M:%S"), "기능": func[:1],
-            "파일": uploaded.name, "성공": ok, "실패": fail, "건너뜀": skip})
+            "파일": uploaded.name + (f" · {sheet_name}" if sheet_name else ""),
+            "성공": ok, "실패": fail, "건너뜀": skip})
 
 if "res" in st.session_state:
     res = st.session_state["res"]
