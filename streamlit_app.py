@@ -136,6 +136,12 @@ def build_address(grid, r, sel):
     return f"{prefix} {j}".strip()
 
 
+def full_addr(grid, r, sel, prefix=""):
+    """조립한 주소 앞에 공통 접두어(예: 시도명)를 붙인다. 접두어가 없거나 주소가 비면 그대로."""
+    a = build_address(grid, r, sel)
+    return f"{prefix} {a}" if (prefix and a) else a
+
+
 def detect_layout(grid):
     max_r = min(n_rows(grid), 300); max_c = min(n_cols(grid), MAX_COLS)
     hits = {}
@@ -399,9 +405,15 @@ if uploaded:
                 sel["bon_col"] = o2i[c1.selectbox("본번 열", opts)]
                 sel["bu_col"] = o2i[c2.selectbox("부번 열", opts)]
 
+        prefix_common = st.text_input(
+            "주소 앞에 공통으로 붙일 내용 (선택)", value="",
+            placeholder="예: 전북특별자치도 — 데이터에 시도가 빠져 있을 때만",
+            help="파일 전체가 같은 지역인데 주소에 그 앞부분(보통 시도)이 빠져 있으면 여기에 적어 주세요. "
+                 "모든 행 앞에 자동으로 붙습니다. 지역이 섞인 파일이면 비워 두세요.").strip()
+
         prev, r = [], int(start_row)
         while r <= n_rows(grid) and len(prev) < 10:
-            a = build_address(grid, r, sel)
+            a = full_addr(grid, r, sel, prefix_common)
             if a and any(ch.isdigit() for ch in a):
                 prev.append(a)
             r += 1
@@ -419,7 +431,7 @@ if uploaded:
 
         # (1) 주소 문자열을 먼저 모두 만든다 (로컬 계산, 빠름)
         rows = range(int(start_row), n_rows(grid) + 1)
-        addrs = [build_address(grid, rr, sel) for rr in rows]
+        addrs = [full_addr(grid, rr, sel, prefix_common) for rr in rows]
         valid = [a for a in addrs if a and any(ch.isdigit() for ch in a)]
         skip = len(addrs) - len(valid)
         crs = CRS_OPTIONS[crs_label][0] if func.startswith("②") else "EPSG:4326"
