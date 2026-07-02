@@ -336,6 +336,13 @@ if uploaded:
 
     with st.container(border=True):
         st.markdown("##### 📋 주소 열 확인")
+        st.caption("먼저 아래 **파일 미리보기**에서 주소·본번·부번이 각각 어느 열(A·B·C…)에 있는지 확인한 뒤, 그 아래에서 열을 지정하세요.")
+        pv_r = min(10, n_rows(grid)); pv_c = min(n_cols(grid), MAX_COLS)
+        head_df = pd.DataFrame(
+            [[cell_str(grid, rr, c) for c in range(1, pv_c + 1)] for rr in range(1, pv_r + 1)],
+            columns=[idx_to_col(c) for c in range(1, pv_c + 1)])
+        head_df.index = range(1, pv_r + 1)   # 실제 행 번호(1부터) — '데이터 시작 행' 판단에 도움
+        st.dataframe(head_df, use_container_width=True, height=min(38 * (pv_r + 1), 400))
         start_row = st.number_input("데이터 시작 행", min_value=1, value=int(det["start_row"]))
         opts, o2i, i2o = build_options(grid, start_row)
         mode = st.radio("주소 형태", ["한 칸에 전체주소", "여러 칸으로 쪼갬"],
@@ -346,9 +353,12 @@ if uploaded:
             addr_label = st.selectbox("주소 열", opts, index=opts.index(default))
             sel = {"start_row": int(start_row), "kind": "full", "addr_col": o2i[addr_label]}
         else:
-            admin_default = det["cols"][:-1] if det["mode"] == "split" else []
+            # '한 칸 전체주소'로 감지된 경우엔 그 열을 구성1 기본값으로 넣어 준다(하이브리드 대응)
+            admin_default = det["cols"][:-1] if det["mode"] == "split" else det["cols"]
             jibun_default = det["cols"][-1] if det["mode"] == "split" else None
             st.markdown("**주소 구성 열** — 큰 단위 → 작은 단위 순서 (예: 시도·시군구·읍면동·리)")
+            st.caption("💡 주소가 한 칸(예: D열 '전북특별자치도 전주시 덕진구 우아동3가')에 통째로 있으면 "
+                       "**구성 1에 그 열 하나만** 고르고, 본번·부번은 아래 '본번·부번 분리'로 따로 지정하면 됩니다.")
             cc = st.columns(3); admin_cols = []
             for i in range(5):
                 dflt = i2o.get(admin_default[i], "(없음)") if i < len(admin_default) else "(없음)"
@@ -367,7 +377,7 @@ if uploaded:
                 sel["bu_col"] = o2i[c2.selectbox("부번 열", opts)]
 
         prev, r = [], int(start_row)
-        while r <= n_rows(grid) and len(prev) < 3:
+        while r <= n_rows(grid) and len(prev) < 10:
             a = build_address(grid, r, sel)
             if a and any(ch.isdigit() for ch in a):
                 prev.append(a)
