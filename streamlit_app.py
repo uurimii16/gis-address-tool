@@ -6,9 +6,11 @@ GIS 주소 변환기 (웹 / Streamlit)
 """
 import io
 import re
+import csv
 import json
 import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -17,6 +19,12 @@ from openpyxl import load_workbook
 
 GEOCODE_URL = "https://api.vworld.kr/req/address"
 DATA_URL = "https://api.vworld.kr/req/data"
+
+MAX_WORKERS = 8          # 동시에 물어보는 주소 개수 (병렬 처리)
+MAX_ROWS = 100_000       # 안전을 위한 최대 처리 행 수
+MAX_COLS = 60            # 읽어들일 최대 열 수
+XLSX_SIZE_LIMIT_MB = 20  # 엑셀 업로드 한도 (read_only 로딩이라 크게 잡아도 안전)
+CSV_SIZE_LIMIT_MB = 40   # CSV 업로드 한도 (메모리 부담이 더 적음)
 
 SIDO = ["서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시",
         "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "강원도", "충청북도",
@@ -35,69 +43,29 @@ CSV_ENCODINGS = {
 }
 
 
-# ---------- 공통 로직 ----------
-def idx_to_col(i):
-    s = ""
-    while i > 0:
-        i, rem = divmod(i - 1, 26)
-        s = chr(65 + rem) + s
-    return s
+# ---------- 파일 읽기 (xlsx·csv 모두 문자열 2차원 리스트 grid 로 통일; r,c는 1-based) ----------
+def _normalize(row_iter):
+    """행 반복자를 문자열 2차원 리스트로 변환. 열은 MAX_COLS, 행은 MAX_ROWS로 상한."""
+    grid, truncated = [], False
+    for row in row_iter:
+        grid.append(["" if v is None else str(v).strip() for v in row[:MAX_COLS]])
+        if len(grid) >= MAX_ROWS:
+            truncated = True
+            break
+    return grid, truncated
 
 
-def cell_str(ws, r, c):
-    if not c:
-        return ""
-    v = ws.cell(row=r, column=c).value
-    return "" if v is None else str(v).strip()
+def read_xlsx_grid(file_bytes):
+    """엑셀을 read_only(스트리밍) 모드로 훑어 grid 로 변환. 통째로 메모리에 올리지 않아 큰 파일도 안전."""
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    try:
+        return _normalize(wb.active.iter_rows(values_only=True))
+    finally:
+        wb.close()
 
 
-def parse_bonbu(pnu):
-    if pnu and len(pnu) == 19:
-        return int(pnu[11:15]), int(pnu[15:19])
-    return None, None
-
-
-def build_address(ws, r, sel):
-    if sel["kind"] == "full":
-        return cell_str(ws, r, sel.get("addr_col"))
-    prefix = " ".join(p for p in (cell_str(ws, r, c) for c in sel["admin_cols"]) if p).strip()
-    if sel["jibun_kind"] == "cell":
-        j = cell_str(ws, r, sel.get("jibun_col"))
-    else:
-        bon_raw = cell_str(ws, r, sel.get("bon_col"))
-        bu_raw = cell_str(ws, r, sel.get("bu_col"))
-        is_san = bon_raw.replace(" ", "").startswith("산")
-        bon = "".join(ch for ch in bon_raw if ch.isdigit())
-        bu = "".join(ch for ch in bu_raw if ch.isdigit())
-        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
-        j = (f"산 {core}" if is_san else core)
-    return f"{prefix} {j}".strip()
-
-
-class _Cell:
-    __slots__ = ("value",)
-    def __init__(self, value):
-        self.value = value
-
-
-class SheetView:
-    """CSV(2차원 리스트)를 openpyxl 워크시트처럼 보이게 하는 경량 래퍼.
-    아래 로직이 쓰는 max_row / max_column / cell(row, column).value 만 제공한다."""
-    def __init__(self, rows):
-        self._rows = rows
-        self.max_row = len(rows)
-        self.max_column = max((len(r) for r in rows), default=0)
-
-    def cell(self, row, column):
-        r, c = row - 1, column - 1
-        if 0 <= r < len(self._rows) and 0 <= c < len(self._rows[r]):
-            return _Cell(self._rows[r][c])
-        return _Cell(None)
-
-
-def read_csv_rows(data_bytes, enc):
-    """CSV 바이트를 2차원 문자열 리스트로 변환. enc=None이면 여러 인코딩을 순서대로 시도(자동 감지)."""
-    import csv as _csv
+def read_csv_grid(data_bytes, enc):
+    """CSV 바이트를 grid 로 변환. enc=None이면 여러 인코딩을 순서대로 시도(자동 감지)."""
     tries = [enc] if enc else ["utf-8-sig", "cp949", "euc-kr", "latin1"]
     text = used = last = None
     for e in tries:
@@ -107,16 +75,63 @@ def read_csv_rows(data_bytes, enc):
             last = ex
     if text is None:
         raise last or ValueError("인코딩을 인식하지 못했습니다.")
-    rows = list(_csv.reader(io.StringIO(text)))
-    return rows, used
+    grid, truncated = _normalize(csv.reader(io.StringIO(text)))
+    return grid, used, truncated
 
 
-def detect_layout(ws):
-    max_r = min(ws.max_row, 300); max_c = min(ws.max_column, 60)
+def n_rows(grid):
+    return len(grid)
+
+
+def n_cols(grid):
+    return max((len(r) for r in grid), default=0)
+
+
+def cell_str(grid, r, c):
+    if not c or r < 1 or r > len(grid):
+        return ""
+    row = grid[r - 1]
+    return row[c - 1] if 1 <= c <= len(row) else ""
+
+
+# ---------- 공통 로직 ----------
+def idx_to_col(i):
+    s = ""
+    while i > 0:
+        i, rem = divmod(i - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def parse_bonbu(pnu):
+    if pnu and len(pnu) == 19:
+        return int(pnu[11:15]), int(pnu[15:19])
+    return None, None
+
+
+def build_address(grid, r, sel):
+    if sel["kind"] == "full":
+        return cell_str(grid, r, sel.get("addr_col"))
+    prefix = " ".join(p for p in (cell_str(grid, r, c) for c in sel["admin_cols"]) if p).strip()
+    if sel["jibun_kind"] == "cell":
+        j = cell_str(grid, r, sel.get("jibun_col"))
+    else:
+        bon_raw = cell_str(grid, r, sel.get("bon_col"))
+        bu_raw = cell_str(grid, r, sel.get("bu_col"))
+        is_san = bon_raw.replace(" ", "").startswith("산")
+        bon = "".join(ch for ch in bon_raw if ch.isdigit())
+        bu = "".join(ch for ch in bu_raw if ch.isdigit())
+        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
+        j = (f"산 {core}" if is_san else core)
+    return f"{prefix} {j}".strip()
+
+
+def detect_layout(grid):
+    max_r = min(n_rows(grid), 300); max_c = min(n_cols(grid), MAX_COLS)
     hits = {}
     for r in range(1, max_r + 1):
         for c in range(1, max_c + 1):
-            v = cell_str(ws, r, c)
+            v = cell_str(grid, r, c)
             if v and any(v.startswith(s) for s in SIDO):
                 hits.setdefault(c, []).append((r, v))
     if not hits:
@@ -129,7 +144,7 @@ def detect_layout(ws):
     jibun_re = re.compile(r"^산?\d+(-\d+)?$")
     cols = [sido_col]; c = sido_col + 1
     while c <= max_c and len(cols) < 6:
-        vals = [cell_str(ws, rr, c) for rr in range(start_row, min(start_row + 8, max_r + 1))]
+        vals = [cell_str(grid, rr, c) for rr in range(start_row, min(start_row + 8, max_r + 1))]
         vals = [v for v in vals if v]
         if not vals:
             break
@@ -176,12 +191,12 @@ def get_parcel(x, y, api_key, domain="localhost", retries=3):
     return None, None
 
 
-def build_options(ws, start_row):
+def build_options(grid, start_row):
     opts = ["(없음)"]; o2i = {"(없음)": None}
-    for c in range(1, min(ws.max_column, 60) + 1):
+    for c in range(1, min(n_cols(grid), MAX_COLS) + 1):
         sample = ""
-        for rr in range(start_row, min(start_row + 15, ws.max_row + 1)):
-            s = cell_str(ws, rr, c)
+        for rr in range(start_row, min(start_row + 15, n_rows(grid) + 1)):
+            s = cell_str(grid, rr, c)
             if s:
                 sample = s[:14]; break
         label = f"{idx_to_col(c)} : {sample}" if sample else f"{idx_to_col(c)} :"
@@ -244,7 +259,7 @@ with st.expander("ℹ️  사용 방법 (처음이라면 펼쳐 보세요)", exp
     st.markdown(
         "1. **VWorld 인증키** — 각자 발급(무료) 후 입력합니다.\n"
         "2. **기능 선택** — ① PNU · ② 좌표 · ③ QGIS 레이어\n"
-        "3. **엑셀 업로드** — .xlsx 파일을 올리면 주소 열을 자동 인식합니다 (미리보기로 확인·수정 가능).\n"
+        "3. **파일 업로드** — .xlsx 또는 .csv 파일을 올리면 주소 열을 자동 인식합니다 (미리보기로 확인·수정 가능).\n"
         "4. **변환 시작** — 결과를 표로 확인하고 내려받습니다.\n\n"
         "※ 입력한 키와 파일은 변환에만 쓰이며, 별도로 저장하지 않습니다.")
 
@@ -279,30 +294,28 @@ with st.container(border=True):
 
 # 4) 파일 업로드 + 열 확인
 uploaded = st.file_uploader(
-    "엑셀(.xlsx) 또는 CSV 파일을 올려 주세요  ·  주소가 담긴 가벼운 파일", type=["xlsx", "csv"])
+    "엑셀(.xlsx) 또는 CSV 파일을 올려 주세요  ·  주소가 담긴 파일", type=["xlsx", "csv"])
 
 if uploaded:
     ext = uploaded.name.rsplit(".", 1)[-1].lower()
     size_mb = (uploaded.size or 0) / 1_000_000
-    limit = 40 if ext == "csv" else 8   # CSV는 메모리 부담이 적어 한도를 더 크게
+    limit = CSV_SIZE_LIMIT_MB if ext == "csv" else XLSX_SIZE_LIMIT_MB
     if size_mb > limit:
         st.error(
             f"파일이 너무 큽니다 (약 {size_mb:.0f}MB · 현재 한도 {limit}MB).\n\n"
             "이 도구는 **주소 목록**용이에요. 수십만 행짜리 큰 파일은 무료 서버 메모리 한도를 "
             "넘어 멈출 수 있어, 처리를 막았습니다.\n\n"
             "👉 주소가 담긴 부분만 남겨 가볍게 만든 뒤 다시 올려 주세요."
-            + ("\n\n💡 엑셀(.xlsx)은 메모리를 많이 써 한도가 더 작아요. "
-               "**CSV로 저장**하면 더 큰 파일도 올릴 수 있습니다." if ext == "xlsx" else ""))
+            + ("\n\n💡 엑셀(.xlsx)보다 **CSV로 저장**하면 더 큰 파일도 올릴 수 있습니다." if ext == "xlsx" else ""))
         st.stop()
 
+    truncated = False
     if ext == "csv":
         enc_label = st.selectbox(
             "CSV 인코딩", list(CSV_ENCODINGS),
             help="한글이 깨져 보이면 인코딩을 바꿔 주세요. 공공데이터·SGIS CSV는 보통 CP949입니다.")
         try:
-            rows, used_enc = read_csv_rows(uploaded.getvalue(), CSV_ENCODINGS[enc_label])
-            ws = SheetView(rows)
-            det = detect_layout(ws)
+            grid, used_enc, truncated = read_csv_grid(uploaded.getvalue(), CSV_ENCODINGS[enc_label])
         except Exception as e:
             st.error(f"CSV를 읽는 중 문제가 발생했습니다. 인코딩을 바꿔 보세요.\n\n{type(e).__name__}: {e}")
             st.stop()
@@ -310,17 +323,21 @@ if uploaded:
             st.caption(f"인코딩 자동 감지: **{used_enc}** · 한글이 깨지면 위에서 직접 선택해 주세요.")
     else:
         try:
-            wb = load_workbook(io.BytesIO(uploaded.getvalue()))
-            ws = wb.active
-            det = detect_layout(ws)
+            grid, truncated = read_xlsx_grid(uploaded.getvalue())
         except Exception as e:
             st.error(f"파일을 여는 중 문제가 발생했습니다.\n\n{type(e).__name__}: {e}")
             st.stop()
 
+    if truncated:
+        st.warning(f"행이 매우 많아 처음 {MAX_ROWS:,}행까지만 읽었습니다. "
+                   "나머지 행은 파일을 나눠 다시 올려 주세요.")
+
+    det = detect_layout(grid)
+
     with st.container(border=True):
         st.markdown("##### 📋 주소 열 확인")
         start_row = st.number_input("데이터 시작 행", min_value=1, value=int(det["start_row"]))
-        opts, o2i, i2o = build_options(ws, start_row)
+        opts, o2i, i2o = build_options(grid, start_row)
         mode = st.radio("주소 형태", ["한 칸에 전체주소", "여러 칸으로 쪼갬"],
                         index=0 if det["mode"] == "single" else 1, horizontal=True)
 
@@ -350,8 +367,8 @@ if uploaded:
                 sel["bu_col"] = o2i[c2.selectbox("부번 열", opts)]
 
         prev, r = [], int(start_row)
-        while r <= ws.max_row and len(prev) < 3:
-            a = build_address(ws, r, sel)
+        while r <= n_rows(grid) and len(prev) < 3:
+            a = build_address(grid, r, sel)
             if a and any(ch.isdigit() for ch in a):
                 prev.append(a)
             r += 1
@@ -366,26 +383,62 @@ if uploaded:
         if not api_key.strip():
             st.error("먼저 VWorld 인증키를 입력해 주세요.")
             st.stop()
-        rows = list(range(int(start_row), ws.max_row + 1))
-        bar = st.progress(0.0, text="변환 중...")
-        records, pts, pgs = [], [], []
-        ok = fail = skip = 0
-        for n, rr in enumerate(rows, 1):
-            addr = build_address(ws, rr, sel)
-            if not addr or not any(ch.isdigit() for ch in addr):
-                skip += 1; bar.progress(n / len(rows)); continue
-            crs = CRS_OPTIONS[crs_label][0] if func.startswith("②") else "EPSG:4326"
+
+        # (1) 주소 문자열을 먼저 모두 만든다 (로컬 계산, 빠름)
+        rows = range(int(start_row), n_rows(grid) + 1)
+        addrs = [build_address(grid, rr, sel) for rr in rows]
+        valid = [a for a in addrs if a and any(ch.isdigit() for ch in a)]
+        skip = len(addrs) - len(valid)
+        crs = CRS_OPTIONS[crs_label][0] if func.startswith("②") else "EPSG:4326"
+
+        if not valid:
+            st.warning("변환할 주소를 찾지 못했습니다. 주소 열과 시작 행을 확인해 주세요.")
+            st.stop()
+
+        # (2) 한 주소가 필요로 하는 모든 조회(지오코딩+필지)를 한 작업으로 묶는다
+        def work(addr):
             pnu, x, y, refined, status = geocode(addr, api_key, crs)
+            item = {"addr": addr, "status": status, "pnu": pnu, "x": x, "y": y, "refined": refined}
+            need_parcel = ((func.startswith("①") and want_jiga) or
+                           (func.startswith("③") and want_pg))
+            if need_parcel and status == "OK" and x:
+                item["geom"], item["props"] = get_parcel(x, y, api_key)
+            return item
+
+        # (3) 여러 주소를 동시에 처리 (병렬) — 결과는 입력 순서대로 보존
+        results = [None] * len(valid)
+        bar = st.progress(0.0, text="변환 중...")
+        total = len(valid)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            fut2pos = {ex.submit(work, a): p for p, a in enumerate(valid)}
+            done = 0
+            for fut in as_completed(fut2pos):
+                results[fut2pos[fut]] = fut.result()
+                done += 1
+                bar.progress(done / total, text=f"변환 중... {done}/{total}")
+        bar.progress(1.0, text="완료")
+
+        # (4) 순서대로 결과 조립
+        records, pts, pgs = [], [], []
+        ok = fail = 0
+        for item in results:
+            addr, status = item["addr"], item["status"]
+            pnu, x, y, refined = item["pnu"], item["x"], item["y"], item["refined"]
+            if status == "OK":
+                ok += 1
+            else:
+                fail += 1
 
             if func.startswith("①"):
-                if status == "OK" and not (pnu and len(pnu) == 19):
-                    status = "PNU불완전"
+                st_ = status
+                if st_ == "OK" and not (pnu and len(pnu) == 19):
+                    st_ = "PNU불완전"
                 bon, bu = parse_bonbu(pnu)
                 rec = {"입력주소": addr, "PNU": pnu, "정제주소": refined,
-                       "본번": bon, "부번": bu, "상태": status}
+                       "본번": bon, "부번": bu, "상태": st_}
                 if want_jiga and status == "OK":
-                    geom, props = get_parcel(x, y, api_key)
-                    jg = props.get("jiga") if props else None
+                    props = item.get("props") or {}
+                    jg = props.get("jiga")
                     rec["공시지가(원/㎡)"] = int(jg) if jg and str(jg).isdigit() else None
                     rec["기준연월"] = (f"{props.get('gosi_year','')}.{props.get('gosi_month','')}".strip(".")
                                     if props else None)
@@ -402,7 +455,7 @@ if uploaded:
                                     "geometry": {"type": "Point", "coordinates": [float(x), float(y)]},
                                     "properties": {"입력주소": addr, "정제주소": refined, "PNU": pnu, "본번": bon, "부번": bu}})
                     if want_pg:
-                        geom, props = get_parcel(x, y, api_key)
+                        geom, props = item.get("geom"), item.get("props") or {}
                         if geom:
                             jg = props.get("jiga")
                             pgs.append({"type": "Feature", "geometry": geom,
@@ -411,14 +464,6 @@ if uploaded:
                 else:
                     records.append({"입력주소": addr, "상태": status})
 
-            if status == "OK":
-                ok += 1
-            else:
-                fail += 1
-            bar.progress(n / len(rows), text=f"변환 중... {n}/{len(rows)}")
-            time.sleep(0.03)
-
-        bar.progress(1.0, text="완료")
         st.session_state["res"] = {"func": func, "records": records, "pts": pts, "pgs": pgs,
                                    "ok": ok, "fail": fail, "skip": skip}
         st.session_state.setdefault("history", []).insert(0, {
