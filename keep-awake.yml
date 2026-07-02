@@ -1,0 +1,21 @@
+name: Keep Streamlit App Awake
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 6시간마다 (UTC 기준)
+  workflow_dispatch:         # 수동 실행 버튼
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Visit Streamlit app
+        env:
+          # (선택) repo Settings > Secrets and variables > Actions > Variables 에
+          # STREAMLIT_URL 을 만들면 그 값을 쓰고, 없으면 아래 기본값 사용.
+          STREAMLIT_URL: ${{ vars.STREAMLIT_URL || 'https://gis-address-tool-3gahdq8hlmkpfpyfg2dz4q.streamlit.app/' }}
+        run: python .github/keep_awake.py
