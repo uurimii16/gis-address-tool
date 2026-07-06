@@ -20,7 +20,7 @@ from openpyxl import load_workbook
 GEOCODE_URL = "https://api.vworld.kr/req/address"
 DATA_URL = "https://api.vworld.kr/req/data"
 
-MAX_WORKERS = 8          # 동시에 물어보는 주소 개수 (병렬 처리)
+MAX_WORKERS = 12         # 동시에 물어보는 주소 개수 (병렬 처리)
 MAX_ROWS = 100_000       # 안전을 위한 최대 처리 행 수
 MAX_COLS = 60            # 읽어들일 최대 열 수
 XLSX_SIZE_LIMIT_MB = 20  # 엑셀 업로드 한도 (read_only 로딩이라 크게 잡아도 안전)
@@ -41,6 +41,35 @@ CSV_ENCODINGS = {
     "CP949 / EUC-KR (한글 윈도우·공공데이터 CSV)": "cp949",
     "UTF-8": "utf-8-sig",
 }
+
+REQ_TIMEOUT = 10   # 한 번 호출을 기다리는 최대 시간(초) — 넘으면 재시도
+
+# 커넥션 재사용용 세션 (TLS 핸드셰이크 재활용 → 정상일 때 더 빠름).
+# 일부 방화벽/WAF는 기본 python-requests UA를 막으므로 UA도 지정한다.
+_session = requests.Session()
+_session.headers.update({"User-Agent": "gis-address-tool/1.0 (+github.com/uurimii16/gis-address-tool)"})
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=0)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+
+def _vworld_json(url, params, timeout=REQ_TIMEOUT):
+    """VWorld를 호출해 (json, None) 또는 (None, 사람이 읽을 실패사유)를 반환.
+    실패사유가 있으면 대개 '일시적'(빈응답·연결끊김·5xx)이라 재시도 가치가 있다."""
+    try:
+        r = _session.get(url, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        return None, "연결실패:" + type(e).__name__
+    if r.status_code != 200:
+        return None, f"HTTP{r.status_code}"
+    try:
+        return r.json(), None
+    except ValueError:
+        body = (r.text or "").strip()
+        # VWorld는 정상이면 항상 JSON을 준다. 본문이 비었으면 IP 차단/스로틀링 정황.
+        return None, ("빈응답(IP제한 의심)" if not body
+                      else "비정상응답:" + body[:60].replace("\n", " "))
 
 
 # ---------- 파일 읽기 (xlsx·csv 모두 문자열 2차원 리스트 grid 로 통일; r,c는 1-based) ----------
@@ -173,37 +202,50 @@ def detect_layout(grid):
 
 def geocode(addr, api_key, crs="EPSG:4326", retries=3):
     last = "실패"
-    for _ in range(retries):
-        try:
-            g = requests.get(GEOCODE_URL, params={
-                "service": "address", "request": "getcoord", "version": "2.0",
-                "crs": crs, "address": addr, "type": "PARCEL",
-                "format": "json", "key": api_key}, timeout=20).json()
-            if g["response"]["status"] != "OK":
-                return None, None, None, None, "주소인식실패"
-            s = g["response"]["refined"]["structure"]
-            pnu = s.get("level4LC", "")
-            refined = g["response"]["refined"].get("text", "")
-            pt = g["response"]["result"]["point"]
-            return pnu, pt["x"], pt["y"], refined, "OK"
-        except Exception as e:
-            last = str(e)[:40]; time.sleep(1.2)
+    for attempt in range(retries):
+        j, err = _vworld_json(GEOCODE_URL, {
+            "service": "address", "request": "getcoord", "version": "2.0",
+            "crs": crs, "address": addr, "type": "PARCEL",
+            "format": "json", "key": api_key})
+        if err is None:
+            resp = j.get("response", {})
+            if resp.get("status") == "OK":
+                try:
+                    s = resp["refined"]["structure"]
+                    pt = resp["result"]["point"]
+                    return (s.get("level4LC", ""), pt["x"], pt["y"],
+                            resp["refined"].get("text", ""), "OK")
+                except (KeyError, TypeError):
+                    return None, None, None, None, "주소인식실패"
+            # VWorld가 확정 답(에러/미검색)을 준 경우 — 재시도해도 결과 동일하니 즉시 종료
+            code = (resp.get("error") or {}).get("code", "")
+            if code == "INVALID_KEY":
+                return None, None, None, None, "인증키오류"
+            return None, None, None, None, "주소인식실패"
+        # 여기 도달 = 빈응답·연결끊김·5xx 등 일시적 → 잠깐 쉬고 재시도
+        last = err
+        if attempt < retries - 1:
+            time.sleep(0.4 * (attempt + 1))
     return None, None, None, None, f"통신실패:{last}"
 
 
 def get_parcel(x, y, api_key, domain="localhost", retries=3):
-    for _ in range(retries):
-        try:
-            d = requests.get(DATA_URL, params={
-                "service": "data", "request": "GetFeature", "data": "LP_PA_CBND_BUBUN",
-                "version": "2.0", "geomFilter": f"POINT({x} {y})", "crs": "EPSG:4326",
-                "format": "json", "size": "1", "domain": domain, "key": api_key}, timeout=20).json()
-            if d["response"]["status"] != "OK":
+    for attempt in range(retries):
+        j, err = _vworld_json(DATA_URL, {
+            "service": "data", "request": "GetFeature", "data": "LP_PA_CBND_BUBUN",
+            "version": "2.0", "geomFilter": f"POINT({x} {y})", "crs": "EPSG:4326",
+            "format": "json", "size": "1", "domain": domain, "key": api_key})
+        if err is None:
+            resp = j.get("response", {})
+            if resp.get("status") != "OK":
                 return None, None
-            feat = d["response"]["result"]["featureCollection"]["features"][0]
-            return feat.get("geometry"), feat.get("properties", {})
-        except Exception:
-            time.sleep(1.2)
+            try:
+                feat = resp["result"]["featureCollection"]["features"][0]
+                return feat.get("geometry"), feat.get("properties", {})
+            except (KeyError, IndexError, TypeError):
+                return None, None
+        if attempt < retries - 1:
+            time.sleep(0.4 * (attempt + 1))
     return None, None
 
 
