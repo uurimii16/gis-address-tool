@@ -599,10 +599,26 @@ if "res" in st.session_state:
                                file_name="필지.geojson", mime="application/geo+json", use_container_width=True)
         st.caption("내려받은 .geojson 파일을 QGIS 창에 끌어다 놓으면 바로 표시됩니다.")
     else:
+        st.markdown("##### ⬇ 결과 내려받기")
+        dl1, dl2 = st.columns(2)
+
+        # 1) 엑셀(.xlsx) — 한글 걱정 없음
         buf = io.BytesIO(); df.to_excel(buf, index=False)
-        st.download_button("⬇ 결과 엑셀 (.xlsx)", buf.getvalue(), file_name="변환결과.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+        dl1.download_button("엑셀 (.xlsx)", buf.getvalue(), file_name="변환결과.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True)
+
+        # 2) CSV(.csv) — 인코딩 선택 (한글 안 깨지게)
+        CSV_OUT = {
+            "UTF-8 (엑셀·메모장 어디서나 안 깨짐, 권장)": "utf-8-sig",
+            "CP949 / EUC-KR (한글 윈도우 엑셀 전용)": "cp949",
+        }
+        enc_label = dl2.selectbox("CSV 인코딩", list(CSV_OUT),
+                                  help="엑셀에서 열었을 때 한글이 깨지면 다른 인코딩으로 받아 보세요. "
+                                       "보통 UTF-8이면 됩니다.")
+        csv_bytes = df.to_csv(index=False).encode(CSV_OUT[enc_label], errors="replace")
+        dl2.download_button("CSV (.csv)", csv_bytes, file_name="변환결과.csv",
+                            mime="text/csv", use_container_width=True)
 
 # ---- 세션 변환 기록 ----
 if st.session_state.get("history"):
