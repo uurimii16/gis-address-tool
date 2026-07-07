@@ -53,6 +53,11 @@ _adapter = requests.adapters.HTTPAdapter(
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
 
+# 회로 차단기: 연결실패가 이만큼 쌓이면 재시도를 멈추고 빨리 실패시킨다.
+# (VWorld 연결이 통째로 막힌 환경에서 주소마다 재시도하며 한없이 느려지는 것 방지)
+_CIRCUIT_TRIP = 8
+_conn_fail = {"n": 0}   # 스레드 간 공유. 대략치라 락 없이 사용(오차 무해).
+
 
 def _vworld_json(url, params, timeout=REQ_TIMEOUT):
     """VWorld를 호출해 (json, None) 또는 (None, 사람이 읽을 실패사유)를 반환.
@@ -202,12 +207,15 @@ def detect_layout(grid):
 
 def geocode(addr, api_key, crs="EPSG:4326", retries=3):
     last = "실패"
-    for attempt in range(retries):
+    # 연결실패가 이미 많이 쌓였으면 재시도 없이 1번만 시도(빨리 실패)
+    attempts = 1 if _conn_fail["n"] >= _CIRCUIT_TRIP else retries
+    for attempt in range(attempts):
         j, err = _vworld_json(GEOCODE_URL, {
             "service": "address", "request": "getcoord", "version": "2.0",
             "crs": crs, "address": addr, "type": "PARCEL",
             "format": "json", "key": api_key})
         if err is None:
+            _conn_fail["n"] = 0   # 한 번이라도 응답이 오면 회로 복구
             resp = j.get("response", {})
             if resp.get("status") == "OK":
                 try:
@@ -224,8 +232,9 @@ def geocode(addr, api_key, crs="EPSG:4326", retries=3):
             return None, None, None, None, "주소인식실패"
         # 여기 도달 = 빈응답·연결끊김·5xx 등 일시적 → 잠깐 쉬고 재시도
         last = err
-        if attempt < retries - 1:
+        if attempt < attempts - 1:
             time.sleep(0.4 * (attempt + 1))
+    _conn_fail["n"] += 1
     return None, None, None, None, f"통신실패:{last}"
 
 
@@ -561,7 +570,16 @@ if uploaded:
 
 if "res" in st.session_state:
     res = st.session_state["res"]
-    st.success("변환이 완료되었습니다.")
+    ok_n, fail_n = res["ok"], res["fail"]
+    if ok_n == 0 and fail_n > 0:
+        st.error(f"❌ 변환에 모두 실패했습니다 (실패 {fail_n}건). 아래 표의 **상태** 열을 확인하세요.\n\n"
+                 "· **통신실패:연결실패/빈응답/502** → VWorld에 연결이 막힌 것 "
+                 "(해외 클라우드 IP 차단). 한국 IP 호스팅(Cloudtype)의 주소로 접속했는지 확인하세요.\n"
+                 "· **인증키오류** → 키 값·공백·상태 확인.")
+    elif fail_n > 0:
+        st.warning(f"⚠️ 변환은 끝났지만 일부 실패했습니다 (성공 {ok_n} / 실패 {fail_n}). 상태 열을 확인하세요.")
+    else:
+        st.success(f"✅ 변환이 완료되었습니다. (성공 {ok_n}건)")
     m1, m2, m3 = st.columns(3)
     m1.metric("✅ 성공", res["ok"]); m2.metric("⚠️ 실패", res["fail"]); m3.metric("➖ 건너뜀", res["skip"])
     df = pd.DataFrame(res["records"])
