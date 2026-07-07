@@ -20,7 +20,7 @@ from openpyxl import load_workbook
 GEOCODE_URL = "https://api.vworld.kr/req/address"
 DATA_URL = "https://api.vworld.kr/req/data"
 
-MAX_WORKERS = 12         # 동시에 물어보는 주소 개수 (병렬 처리)
+MAX_WORKERS = 8          # 동시에 물어보는 주소 개수 (병렬 처리)
 MAX_ROWS = 100_000       # 안전을 위한 최대 처리 행 수
 MAX_COLS = 60            # 읽어들일 최대 열 수
 XLSX_SIZE_LIMIT_MB = 20  # 엑셀 업로드 한도 (read_only 로딩이라 크게 잡아도 안전)
