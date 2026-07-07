@@ -467,7 +467,8 @@ if uploaded:
     run = st.button("🚀 변환 시작", type="primary", use_container_width=True)
 
     if run:
-        if not api_key.strip():
+        api_key = api_key.strip()   # 붙여넣기 때 딸려온 공백·줄바꿈 제거 (인증키오류 방지)
+        if not api_key:
             st.error("먼저 VWorld 인증키를 입력해 주세요.")
             st.stop()
 
