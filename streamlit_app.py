@@ -272,30 +272,8 @@ def build_options(grid, start_row):
 
 
 # ---------- UI ----------
-def _debrand_streamlit():
-    """Streamlit 기본 부팅 화면(index.html)의 'Streamlit' 제목·파비콘을
-    앱 제목으로 덮어써서, 페이지 열 때 잠깐 뜨는 'Streamlit' 마크 깜빡임을 없앤다.
-    (site-packages 파일을 1회 수정. 실패해도 앱 동작엔 전혀 영향 없음.)"""
-    try:
-        import os, re
-        index_path = os.path.join(os.path.dirname(st.__file__), "static", "index.html")
-        with open(index_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        favicon = ("data:image/svg+xml,"
-                   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
-                   "<text y='.9em' font-size='90'>%F0%9F%8C%90</text></svg>")
-        new = re.sub(r"<title>.*?</title>", "<title>GIS 주소 변환기</title>", html, flags=re.S)
-        new = re.sub(r'(<link[^>]*rel="[^"]*icon"[^>]*href=")[^"]*(")',
-                     r"\1" + favicon + r"\2", new)
-        if new != html:
-            with open(index_path, "w", encoding="utf-8") as f:
-                f.write(new)
-    except Exception:
-        pass
-
-
-_debrand_streamlit()
-
+# 참고: Streamlit 부팅 화면(index.html)의 'Streamlit' 제목/파비콘 제거는
+#       patch_index.py 에서 처리한다(Cloudtype Pre start Command 로 실행).
 st.set_page_config(page_title="GIS 주소 변환기", page_icon="🌐", layout="centered")
 
 st.markdown("""
