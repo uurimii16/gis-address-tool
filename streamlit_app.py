@@ -20,11 +20,12 @@ from openpyxl import load_workbook
 GEOCODE_URL = "https://api.vworld.kr/req/address"
 DATA_URL = "https://api.vworld.kr/req/data"
 
-MAX_WORKERS = 8          # 동시에 물어보는 주소 개수 (병렬 처리)
+MAX_WORKERS = 12         # 동시에 물어보는 주소 개수 (병렬 처리)
 MAX_ROWS = 100_000       # 안전을 위한 최대 처리 행 수
 MAX_COLS = 60            # 읽어들일 최대 열 수
-XLSX_SIZE_LIMIT_MB = 20  # 엑셀 업로드 한도 (read_only 로딩이라 크게 잡아도 안전)
-CSV_SIZE_LIMIT_MB = 40   # CSV 업로드 한도 (메모리 부담이 더 적음)
+HEAD_ROWS = 300          # 미리보기·열 자동인식에 쓸 앞부분 행 수 (전체를 다 읽지 않음)
+XLSX_SIZE_LIMIT_MB = 30  # 엑셀 업로드 한도 (head 캐시 + 스트리밍이라 크게 잡아도 안전)
+CSV_SIZE_LIMIT_MB = 60   # CSV 업로드 한도 (메모리 부담이 더 적음)
 
 SIDO = ["서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시",
         "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "강원도", "충청북도",
@@ -77,18 +78,51 @@ def _vworld_json(url, params, timeout=REQ_TIMEOUT):
                       else "비정상응답:" + body[:60].replace("\n", " "))
 
 
-# ---------- 파일 읽기 (xlsx·csv 모두 문자열 2차원 리스트 grid 로 통일; r,c는 1-based) ----------
-def _normalize(row_iter):
-    """행 반복자를 문자열 2차원 리스트로 변환. 열은 MAX_COLS, 행은 MAX_ROWS로 상한."""
-    grid, truncated = [], False
-    for row in row_iter:
-        grid.append(["" if v is None else str(v).strip() for v in row[:MAX_COLS]])
-        if len(grid) >= MAX_ROWS:
-            truncated = True
-            break
-    return grid, truncated
+@st.cache_data(show_spinner=False, ttl=600, max_entries=30)
+def validate_key(api_key):
+    """인증키가 지금 실제로 쓸 수 있는지 VWorld에 물어본다(고정 주소 1건 조회).
+    반환 상태: 'ok'(정상) · 'invalid'(키 오류) · 'network'(연결 안 됨/IP 차단) ·
+               'ok_maybe'(키 자체는 정상으로 보임). 결과는 10분간 캐시."""
+    j, err = _vworld_json(GEOCODE_URL, {
+        "service": "address", "request": "getcoord", "version": "2.0",
+        "crs": "EPSG:4326", "address": "서울특별시 중구 세종대로 110",
+        "type": "ROAD", "format": "json", "key": api_key}, timeout=8)
+    if err is not None:
+        return "network", err
+    resp = j.get("response", {}) if isinstance(j, dict) else {}
+    if resp.get("status") == "OK":
+        return "ok", ""
+    err_obj = resp.get("error") or {}
+    code = str(err_obj.get("code", "")).upper()
+    text = str(err_obj.get("text", ""))
+    if ("KEY" in code or code in {"020", "021"} or "인증키" in text or "등록되지" in text):
+        return "invalid", f"{code} {text}".strip()
+    return "ok_maybe", str(resp.get("status"))
 
 
+# ---------- 파일 읽기 (UI용 head 는 캐시, 변환용 전체는 스트리밍) ----------
+# 화면(미리보기·열 선택)은 앞부분 몇백 행만 있으면 되므로 head 만 읽어 캐시한다.
+#  → 위젯을 만질 때마다 파일을 통째로 다시 파싱하지 않아 가볍고, 큰 파일도 안 멈춘다.
+# 전체 변환은 '변환 시작' 때 한 번만 스트리밍으로 훑어 주소 문자열만 뽑는다(메모리 최소).
+
+def _decode(data_bytes, enc):
+    """바이트 → (text, 사용인코딩). enc=None이면 여러 인코딩을 순서대로 시도."""
+    tries = [enc] if enc else ["utf-8-sig", "cp949", "euc-kr", "latin1"]
+    last = None
+    for e in tries:
+        try:
+            return data_bytes.decode(e), e
+        except Exception as ex:
+            last = ex
+    raise last or ValueError("인코딩을 인식하지 못했습니다.")
+
+
+def _row_cells(row):
+    """openpyxl/csv 한 행 → 문자열 리스트(열은 MAX_COLS 상한)."""
+    return ["" if v is None else str(v).strip() for v in row[:MAX_COLS]]
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
 def xlsx_sheet_names(file_bytes):
     """엑셀의 시트 이름 목록을 반환(가볍게 열고 닫음)."""
     wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
@@ -98,29 +132,59 @@ def xlsx_sheet_names(file_bytes):
         wb.close()
 
 
-def read_xlsx_grid(file_bytes, sheet=None):
-    """엑셀의 지정 시트를 read_only(스트리밍) 모드로 훑어 grid 로 변환. sheet=None이면 첫(활성) 시트."""
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    try:
-        ws = wb[sheet] if (sheet and sheet in wb.sheetnames) else wb.active
-        return _normalize(ws.iter_rows(values_only=True))
-    finally:
-        wb.close()
-
-
-def read_csv_grid(data_bytes, enc):
-    """CSV 바이트를 grid 로 변환. enc=None이면 여러 인코딩을 순서대로 시도(자동 감지)."""
-    tries = [enc] if enc else ["utf-8-sig", "cp949", "euc-kr", "latin1"]
-    text = used = last = None
-    for e in tries:
+@st.cache_data(show_spinner="파일을 읽는 중…", max_entries=2)
+def read_head(file_bytes, ext, sheet, enc, n_head=HEAD_ROWS):
+    """미리보기·열 선택용으로 앞 n_head 행만 grid 로 읽는다 → (grid, 사용인코딩).
+    캐시되므로 화면 위젯을 바꿔도 파일을 다시 파싱하지 않는다."""
+    used = enc
+    grid = []
+    if ext == "csv":
+        text, used = _decode(file_bytes, enc)
+        for row in csv.reader(io.StringIO(text)):
+            grid.append(_row_cells(row))
+            if len(grid) >= n_head:
+                break
+    else:
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
         try:
-            text = data_bytes.decode(e); used = e; break
-        except Exception as ex:
-            last = ex
-    if text is None:
-        raise last or ValueError("인코딩을 인식하지 못했습니다.")
-    grid, truncated = _normalize(csv.reader(io.StringIO(text)))
-    return grid, used, truncated
+            ws = wb[sheet] if (sheet and sheet in wb.sheetnames) else wb.active
+            for row in ws.iter_rows(values_only=True):
+                grid.append(_row_cells(row))
+                if len(grid) >= n_head:
+                    break
+        finally:
+            wb.close()
+    return grid, used
+
+
+def _iter_raw_rows(file_bytes, ext, sheet, enc):
+    """전체 행을 문자열 리스트로 하나씩 내보낸다(스트리밍). 변환 시작 때만 사용."""
+    if ext == "csv":
+        text, _ = _decode(file_bytes, enc)
+        for row in csv.reader(io.StringIO(text)):
+            yield _row_cells(row)
+    else:
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        try:
+            ws = wb[sheet] if (sheet and sheet in wb.sheetnames) else wb.active
+            for row in ws.iter_rows(values_only=True):
+                yield _row_cells(row)
+        finally:
+            wb.close()
+
+
+def collect_addresses(file_bytes, ext, sheet, enc, sel, prefix, start_row):
+    """전체 파일을 스트리밍하며 start_row 이후 주소 문자열만 모은다 → (addrs, truncated).
+    60열짜리 전체 grid 를 메모리에 들지 않아 2만 행 이상도 안전하다."""
+    addrs, truncated = [], False
+    for i, row in enumerate(_iter_raw_rows(file_bytes, ext, sheet, enc), start=1):
+        if i < start_row:
+            continue
+        addrs.append(full_addr_row(row, sel, prefix))
+        if len(addrs) >= MAX_ROWS:
+            truncated = True
+            break
+    return addrs, truncated
 
 
 def n_rows(grid):
@@ -174,6 +238,47 @@ def full_addr(grid, r, sel, prefix=""):
     """조립한 주소 앞에 공통 접두어(예: 시도명)를 붙인다. 접두어가 없거나 주소가 비면 그대로."""
     a = build_address(grid, r, sel)
     return f"{prefix} {a}" if (prefix and a) else a
+
+
+def _row_cell(row, c):
+    """스트리밍 변환용: grid 없이 한 행(문자열 리스트)에서 c번째 열 값(1-based)."""
+    return row[c - 1] if (c and 1 <= c <= len(row)) else ""
+
+
+def build_address_row(row, sel):
+    """grid 없이 한 행만으로 주소를 조립(build_address 의 행 버전)."""
+    if sel["kind"] == "full":
+        return _row_cell(row, sel.get("addr_col"))
+    prefix = " ".join(p for p in (_row_cell(row, c) for c in sel["admin_cols"]) if p).strip()
+    if sel["jibun_kind"] == "cell":
+        j = _row_cell(row, sel.get("jibun_col"))
+    else:
+        bon_raw = _row_cell(row, sel.get("bon_col"))
+        bu_raw = _row_cell(row, sel.get("bu_col"))
+        is_san = bon_raw.replace(" ", "").startswith("산")
+        bon = "".join(ch for ch in bon_raw if ch.isdigit())
+        bu = "".join(ch for ch in bu_raw if ch.isdigit())
+        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
+        j = (f"산 {core}" if is_san else core)
+    return f"{prefix} {j}".strip()
+
+
+def full_addr_row(row, sel, prefix=""):
+    a = build_address_row(row, sel)
+    return f"{prefix} {a}" if (prefix and a) else a
+
+
+def to_csv_bytes(df, encoding, excel_safe):
+    """결과 DataFrame → CSV 바이트. excel_safe면 PNU 등 11자리+ 숫자열을 ="…" 로 감싸
+    Excel 이 지수표기(1.15E+18)로 바꾸지 못하게 한다(값 자체는 그대로 보존)."""
+    if excel_safe:
+        df = df.copy()
+        for col in ("PNU", "고유번호"):
+            if col in df.columns:
+                df[col] = df[col].map(
+                    lambda v: f'="{v}"' if (v is not None and str(v).isdigit()
+                                            and len(str(v)) >= 11) else v)
+    return df.to_csv(index=False).encode(encoding, errors="replace")
 
 
 def detect_layout(grid):
@@ -335,9 +440,24 @@ with st.expander("ℹ️  사용 방법 (처음이라면 펼쳐 보세요)", exp
 # 1) 인증키
 with st.container(border=True):
     st.markdown("##### 🔑 VWorld 인증키")
-    api_key = st.text_input("인증키", value="", type="password",
-                            placeholder="본인이 발급받은 VWorld 인증키를 붙여넣어 주세요",
-                            label_visibility="collapsed")
+    kc1, kc2 = st.columns([5, 1])
+    api_key = kc1.text_input("인증키", value="", type="password",
+                             placeholder="본인이 발급받은 VWorld 인증키를 붙여넣어 주세요",
+                             label_visibility="collapsed")
+    if kc2.button("확인", use_container_width=True,
+                  help="인증키가 지금 쓸 수 있는지 VWorld에 직접 물어봅니다."):
+        validate_key.clear()   # 캐시를 비우고 방금 넣은 키로 다시 확인
+    key_clean = api_key.strip()
+    if key_clean:
+        vstatus, _vdetail = validate_key(key_clean)
+        if vstatus in ("ok", "ok_maybe"):
+            st.success("✅ 인증키 정상 — 지금 바로 변환할 수 있어요.")
+        elif vstatus == "invalid":
+            st.error("❌ 인증키가 올바르지 않아요. VWorld에서 발급한 키인지, "
+                     "앞뒤 공백·오타가 없는지 확인해 주세요.")
+        else:  # network
+            st.warning("⚠️ 지금 VWorld에 연결이 안 돼 인증키를 확인하지 못했어요. "
+                       "잠시 뒤 [확인]을 다시 눌러 주세요. (한국 IP 주소로 접속했는지도 확인)")
     st.caption("발급: [vworld.kr](https://www.vworld.kr) → 오픈API → 인증키 발급 "
                "(활용 API에 **2D 데이터 API** 체크, 사이트 URL은 `http://localhost`)")
 
@@ -367,7 +487,9 @@ uploaded = st.file_uploader(
 
 if uploaded:
     ext = uploaded.name.rsplit(".", 1)[-1].lower()
+    file_bytes = uploaded.getvalue()
     sheet_name = None
+    stream_enc = None   # CSV 전체 스트리밍에 쓸 확정 인코딩
     size_mb = (uploaded.size or 0) / 1_000_000
     limit = CSV_SIZE_LIMIT_MB if ext == "csv" else XLSX_SIZE_LIMIT_MB
     if size_mb > limit:
@@ -379,21 +501,21 @@ if uploaded:
             + ("\n\n💡 엑셀(.xlsx)보다 **CSV로 저장**하면 더 큰 파일도 올릴 수 있습니다." if ext == "xlsx" else ""))
         st.stop()
 
-    truncated = False
     if ext == "csv":
         enc_label = st.selectbox(
             "CSV 인코딩", list(CSV_ENCODINGS),
             help="한글이 깨져 보이면 인코딩을 바꿔 주세요. 공공데이터·SGIS CSV는 보통 CP949입니다.")
         try:
-            grid, used_enc, truncated = read_csv_grid(uploaded.getvalue(), CSV_ENCODINGS[enc_label])
+            grid, used_enc = read_head(file_bytes, "csv", None, CSV_ENCODINGS[enc_label])
         except Exception as e:
             st.error(f"CSV를 읽는 중 문제가 발생했습니다. 인코딩을 바꿔 보세요.\n\n{type(e).__name__}: {e}")
             st.stop()
+        stream_enc = used_enc
         if enc_label == "자동 감지":
             st.caption(f"인코딩 자동 감지: **{used_enc}** · 한글이 깨지면 위에서 직접 선택해 주세요.")
     else:
         try:
-            sheets = xlsx_sheet_names(uploaded.getvalue())
+            sheets = xlsx_sheet_names(file_bytes)
         except Exception as e:
             st.error(f"파일을 여는 중 문제가 발생했습니다.\n\n{type(e).__name__}: {e}")
             st.stop()
@@ -404,14 +526,10 @@ if uploaded:
                 help="엑셀에 시트가 여러 개입니다. 변환할 시트를 하나 고르세요. "
                      "시트별로 골라 각각 변환·내려받기 하면 됩니다.")
         try:
-            grid, truncated = read_xlsx_grid(uploaded.getvalue(), sheet_name)
+            grid, _ = read_head(file_bytes, "xlsx", sheet_name, None)
         except Exception as e:
             st.error(f"시트를 여는 중 문제가 발생했습니다.\n\n{type(e).__name__}: {e}")
             st.stop()
-
-    if truncated:
-        st.warning(f"행이 매우 많아 처음 {MAX_ROWS:,}행까지만 읽었습니다. "
-                   "나머지 행은 파일을 나눠 다시 올려 주세요.")
 
     det = detect_layout(grid)
     sig = f"{sheet_name or 'csv'}-{n_cols(grid)}"   # 시트/구조 바뀌면 열 선택 위젯을 새로 시작
@@ -483,9 +601,13 @@ if uploaded:
             st.error("먼저 VWorld 인증키를 입력해 주세요.")
             st.stop()
 
-        # (1) 주소 문자열을 먼저 모두 만든다 (로컬 계산, 빠름)
-        rows = range(int(start_row), n_rows(grid) + 1)
-        addrs = [full_addr(grid, rr, sel, prefix_common) for rr in rows]
+        # (1) 전체 파일을 한 번만 스트리밍해 주소 문자열을 만든다 (가볍고 빠름)
+        with st.spinner("파일에서 주소를 모으는 중…"):
+            addrs, addr_truncated = collect_addresses(
+                file_bytes, ext, sheet_name, stream_enc, sel, prefix_common, int(start_row))
+        if addr_truncated:
+            st.warning(f"행이 매우 많아 처음 {MAX_ROWS:,}건까지만 처리합니다. "
+                       "나머지 행은 파일을 나눠 다시 올려 주세요.")
         valid = [a for a in addrs if a and any(ch.isdigit() for ch in a)]
         skip = len(addrs) - len(valid)
         crs = CRS_OPTIONS[crs_label][0] if func.startswith("②") else "EPSG:4326"
@@ -602,15 +724,21 @@ if "res" in st.session_state:
         st.caption("내려받은 .geojson 파일을 QGIS 창에 끌어다 놓으면 바로 표시됩니다.")
     else:
         st.markdown("##### ⬇ 결과 내려받기")
+        st.caption("PNU(19자리)는 **엑셀(.xlsx)** 로 받으면 절대 안 깨져요. "
+                   "CSV로 받을 땐 아래 옵션을 켜 두세요.")
+        safe_csv = st.checkbox(
+            "CSV를 Excel에서 열어도 PNU가 숫자로 안 깨지게 (텍스트 고정)", value=True,
+            help='19자리 PNU를 ="…" 형태로 감싸 Excel이 지수표기(1.15E+18)로 바꾸지 못하게 합니다. '
+                 '다른 프로그램에서 다시 불러올 거면 끄고, 엑셀로만 볼 거면 켜 두세요.')
         dl1, dl2 = st.columns(2)
 
-        # 1) 엑셀(.xlsx) — 한글 걱정 없음
+        # 1) 엑셀(.xlsx) — PNU가 문자열로 저장돼 지수표기 걱정 없음
         buf = io.BytesIO(); df.to_excel(buf, index=False)
         dl1.download_button("엑셀 (.xlsx)", buf.getvalue(), file_name="변환결과.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True)
 
-        # 2) CSV(.csv) — 인코딩 선택 (한글 안 깨지게)
+        # 2) CSV(.csv) — 인코딩 선택 (한글 안 깨지게) + PNU 텍스트 고정 옵션
         CSV_OUT = {
             "UTF-8 (엑셀·메모장 어디서나 안 깨짐, 권장)": "utf-8-sig",
             "CP949 / EUC-KR (한글 윈도우 엑셀 전용)": "cp949",
@@ -618,7 +746,7 @@ if "res" in st.session_state:
         enc_label = dl2.selectbox("CSV 인코딩", list(CSV_OUT),
                                   help="엑셀에서 열었을 때 한글이 깨지면 다른 인코딩으로 받아 보세요. "
                                        "보통 UTF-8이면 됩니다.")
-        csv_bytes = df.to_csv(index=False).encode(CSV_OUT[enc_label], errors="replace")
+        csv_bytes = to_csv_bytes(df, CSV_OUT[enc_label], safe_csv)
         dl2.download_button("CSV (.csv)", csv_bytes, file_name="변환결과.csv",
                             mime="text/csv", use_container_width=True)
 
