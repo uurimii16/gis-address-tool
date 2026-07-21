@@ -273,7 +273,7 @@ def build_options(grid, start_row):
 
 # ---------- UI ----------
 # 참고: Streamlit 부팅 화면(index.html)의 'Streamlit' 제목/파비콘 제거는
-#       patch_index.py 에서 처리한다(Cloudtype Pre start Command 로 실행).
+#       patch_index.py 에서 처리한다(Cloudtype Install command 의 빌드 단계에서 실행).
 st.set_page_config(page_title="GIS 주소 변환기", page_icon="🌐", layout="centered")
 
 st.markdown("""

@@ -3,8 +3,11 @@
 앱 제목으로 덮어써서, 페이지 열 때 잠깐 뜨는 'Streamlit' 마크 깜빡임을 없앤다.
 
 Streamlit 서버는 시작 시 index.html을 한 번 읽어 캐시하므로, 반드시
-streamlit 실행 '전'에 돌려야 한다. Cloudtype 의 Pre start Command 에
-`python patch_index.py` 로 등록해 사용한다. 실패해도 앱 동작엔 영향 없음.
+streamlit 실행 '전'에 돌려야 한다. 또한 실행 단계 컨테이너는 site-packages에
+쓰기 권한이 없으므로(Permission denied), 반드시 '빌드 단계'에서 실행해야 한다.
+→ Cloudtype 의 Install command 를 아래처럼 설정한다(빌드=root 권한, 이미지에 구워짐):
+      pip install -r requirements.txt && python patch_index.py
+실패해도 앱 동작엔 영향 없음(try/except).
 """
 import os
 import re
