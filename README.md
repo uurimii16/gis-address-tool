@@ -3,9 +3,9 @@
 주소 목록을 **PNU · 좌표 · QGIS 지도 레이어**로 한 번에 변환해 주는 웹 도구입니다.
 도시계획·GIS 실무에서 반복되는 "주소 → 필지/좌표 변환" 작업을 엑셀·CSV 업로드만으로 자동 처리합니다.
 
-**▶ 바로 사용하기:** https://gis-address-tool-3gahdq8hlmkpfpyfg2dz4q.streamlit.app/
+**▶ 바로 사용하기:** https://port-0-gis-address-tool-mr9vlx4ea220fe3d.sel3.cloudtype.app/
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://gis-address-tool-3gahdq8hlmkpfpyfg2dz4q.streamlit.app/)
+[![바로 사용하기](https://img.shields.io/badge/앱_바로가기-Cloudtype-6C5CE7)](https://port-0-gis-address-tool-mr9vlx4ea220fe3d.sel3.cloudtype.app/)
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-app-red)
 ![VWorld](https://img.shields.io/badge/API-VWorld-brightgreen)

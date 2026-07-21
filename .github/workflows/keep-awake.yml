@@ -17,5 +17,5 @@ jobs:
         env:
           # (선택) repo Settings > Secrets and variables > Actions > Variables 에
           # STREAMLIT_URL 을 만들면 그 값을 쓰고, 없으면 아래 기본값 사용.
-          STREAMLIT_URL: ${{ vars.STREAMLIT_URL || 'https://gis-address-tool-3gahdq8hlmkpfpyfg2dz4q.streamlit.app/' }}
+          STREAMLIT_URL: ${{ vars.STREAMLIT_URL || 'https://port-0-gis-address-tool-mr9vlx4ea220fe3d.sel3.cloudtype.app/' }}
         run: python .github/keep_awake.py
