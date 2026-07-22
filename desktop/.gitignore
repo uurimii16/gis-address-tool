@@ -1,0 +1,10 @@
+# 실제 인증키가 담긴 개인 설정은 올리지 않음 (예제만 커밋)
+config.txt
+
+# 빌드 산출물
+dist/
+dist_*/
+build/
+*.spec
+__pycache__/
+*.pyc

@@ -1,0 +1,4 @@
+requests
+openpyxl
+tkinterdnd2
+pyinstaller
