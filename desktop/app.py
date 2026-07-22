@@ -198,6 +198,27 @@ def parse_bonbu(pnu):
     return None, None
 
 
+def pnu_from_parts(code_val, bon, bu, daejang_val=None):
+    """규칙대로 19자리 PNU를 즉시 조립(통신 없음).
+    code_val = 법정동코드(10) 또는 고유번호(19, 앞10 사용).
+    산여부: 고유번호(19)면 11번째 자리를 그대로, 아니면 대장구분(산/임야→2, 그 외 1)에서.
+    본번·부번은 숫자만 남겨 4자리로 0채움. 코드가 부족하면 빈 문자열."""
+    code = "".join(c for c in str(code_val or "") if c.isdigit())
+    if len(code) >= 19:
+        bjd, flag = code[:10], code[10]
+    elif len(code) >= 10:
+        bjd = code[:10]
+        d = str(daejang_val or "")
+        flag = "2" if ("산" in d or "임야" in d) else "1"
+    else:
+        return ""
+    if flag not in ("1", "2"):
+        flag = "1"
+    mn = "".join(c for c in str(bon or "") if c.isdigit()).zfill(4)
+    sb = "".join(c for c in str(bu or "") if c.isdigit()).zfill(4)
+    return bjd + flag + mn + sb
+
+
 # ---------- VWorld ----------
 def _vworld_json(url, params, timeout=REQ_TIMEOUT):
     """(json, None) 또는 (None, 사람이 읽을 실패사유)."""
@@ -567,6 +588,30 @@ def detect_layout(grid):
     return {"start_row": start_row, "mode": "split", "cols": cols}
 
 
+def detect_combine(grid):
+    """코드 조합 모드용 열 자동 추정: 법정동/고유번호·대장구분·본번·부번·시작행."""
+    max_r = min(n_rows(grid), 200); max_c = min(n_cols(grid), MAX_COLS)
+    code_c = daejang_c = bon_c = bu_c = None
+    for c in range(1, max_c + 1):
+        h = cell_str(grid, 1, c)
+        if not h:
+            continue
+        if code_c is None and any(k in h for k in ("고유번호", "법정동", "PNU", "토지대장", "임야대장", "지번코드")):
+            code_c = c
+        if daejang_c is None and c != code_c and any(k in h for k in ("대장구분", "산구분", "산여부")):
+            daejang_c = c
+        if bon_c is None and "본번" in h:
+            bon_c = c
+        if bu_c is None and "부번" in h:
+            bu_c = c
+    if code_c is None:   # 값 기반 보강: 10자리+ 숫자가 많은 열
+        for c in range(1, max_c + 1):
+            vals = [cell_str(grid, r, c) for r in range(2, min(12, max_r + 1))]
+            if sum(1 for v in vals if v.isdigit() and len(v) >= 10) >= 3:
+                code_c = c; break
+    return {"start_row": 2, "code": code_c, "daejang": daejang_c, "bon": bon_c, "bu": bu_c}
+
+
 # ---------- 시트 선택창 ----------
 def choose_sheet(parent, sheets):
     dlg = tk.Toplevel(parent); dlg.title("시트 선택"); dlg.configure(bg=CARD)
@@ -879,6 +924,130 @@ class ColumnDialog(tk.Toplevel):
         self.result = None; self.destroy()
 
 
+# ---------- PNU 코드 조합 창 (통신 없음) ----------
+class CombineDialog(tk.Toplevel):
+    def __init__(self, parent, grid, detected):
+        super().__init__(parent)
+        self.title("PNU 코드 조합"); self.configure(bg=CARD)
+        self.grid_data = grid; self.result = None; self._ready = False
+        self.resizable(False, False); self.grab_set()
+
+        max_c = min(n_cols(grid), MAX_COLS)
+        self.opts = ["(없음)"]; self.o2i = {"(없음)": None}
+        for c in range(1, max_c + 1):
+            sample = ""
+            for rr in range(detected["start_row"], min(detected["start_row"] + 15, n_rows(grid) + 1)):
+                s = cell_str(grid, rr, c)
+                if s:
+                    sample = s[:16]; break
+            lab = f"{idx_to_col(c)} : {sample}" if sample else f"{idx_to_col(c)} :"
+            self.opts.append(lab); self.o2i[lab] = c
+        self.i2o = {v: k for k, v in self.o2i.items()}
+
+        tk.Label(self, text="PNU 코드 조합 (통신 없이 즉시)", bg=CARD, fg=INK,
+                 font=(UI_FONT, 15, "bold")).grid(row=0, column=0, columnspan=4, pady=(18, 2), padx=24)
+        tk.Label(self, text="법정동코드(또는 고유번호) + 본번 + 부번을 규칙대로 붙여 19자리 PNU를 만듭니다",
+                 bg=CARD, fg=MUTED, font=(UI_FONT, 10)).grid(row=1, column=0, columnspan=4, pady=(0, 8))
+
+        # 파일 미리보기
+        tvf = tk.Frame(self, bg=CARD, highlightbackground=LINE, highlightthickness=1)
+        tvf.grid(row=2, column=0, columnspan=4, padx=24, pady=(0, 10), sticky="we")
+        tk.Label(tvf, text="📄 내 파일 미리보기 (앞부분)", bg=CARD, fg=ACCENT_D,
+                 font=(UI_FONT, 10, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        pv_c = min(n_cols(grid), 10); pv_r = min(n_rows(grid), 8)
+        cols = ["행"] + [idx_to_col(c) for c in range(1, pv_c + 1)]
+        tv = ttk.Treeview(tvf, columns=cols, show="headings", height=pv_r, style="PV.Treeview")
+        tv.heading("행", text="행"); tv.column("행", width=34, anchor="center", stretch=False)
+        for c in range(1, pv_c + 1):
+            key = idx_to_col(c)
+            tv.heading(key, text=key); tv.column(key, width=92, anchor="w", stretch=False)
+        for rr in range(1, pv_r + 1):
+            tv.insert("", "end", values=[rr] + [cell_str(grid, rr, c) for c in range(1, pv_c + 1)])
+        xsb = ttk.Scrollbar(tvf, orient="horizontal", command=tv.xview)
+        tv.configure(xscrollcommand=xsb.set)
+        tv.pack(fill="x", padx=8); xsb.pack(fill="x", padx=8, pady=(0, 6))
+
+        row = tk.Frame(self, bg=CARD); row.grid(row=3, column=0, columnspan=4, pady=4)
+        tk.Label(row, text="데이터 시작 행:", bg=CARD, fg=INK, font=(UI_FONT, 11)).pack(side="left")
+        self.start_var = tk.StringVar(value=str(detected["start_row"]))
+        self.start_var.trace_add("write", lambda *a: self.refresh())
+        tk.Spinbox(row, from_=1, to=999999, width=8, textvariable=self.start_var,
+                   font=(UI_FONT, 11)).pack(side="left", padx=8)
+
+        cf = tk.Frame(self, bg=CARD); cf.grid(row=4, column=0, columnspan=4, pady=6, padx=24)
+        self.cb = {}
+        specs = [("code", "법정동코드 / 고유번호 열", "필수"),
+                 ("daejang", "대장구분(산 여부) 열", "선택 · 고유번호(19자리)면 불필요"),
+                 ("bon", "본번 열", "필수"),
+                 ("bu", "부번 열", "필수")]
+        for i, (kkey, label, hint) in enumerate(specs):
+            tk.Label(cf, text=label, bg=CARD, fg=INK, font=(UI_FONT, 10, "bold")).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            box = ttk.Combobox(cf, values=self.opts, width=24, state="readonly")
+            box.grid(row=i, column=1, pady=3)
+            box.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+            self.cb[kkey] = box
+            tk.Label(cf, text=hint, bg=CARD, fg=MUTED, font=(UI_FONT, 9)).grid(row=i, column=2, sticky="w", padx=8)
+            if detected.get(kkey):
+                box.set(self.i2o.get(detected[kkey], "(없음)"))
+            else:
+                box.set("(없음)")
+
+        tk.Label(self, text="미리보기 (만들어질 PNU)", bg=CARD, fg=ACCENT_D,
+                 font=(UI_FONT, 10, "bold")).grid(row=5, column=0, columnspan=4, pady=(8, 2))
+        self.preview = tk.Label(self, text="", bg=SOFT, fg=INK, justify="left", anchor="w",
+                                width=58, height=4, font=(UI_FONT, 10), padx=12)
+        self.preview.grid(row=6, column=0, columnspan=4, padx=24, pady=4)
+
+        brow = tk.Frame(self, bg=CARD); brow.grid(row=7, column=0, columnspan=4, pady=16)
+        tk.Button(brow, text="변환 시작", command=self.ok, bg=ACCENT, fg="white",
+                  activebackground=ACCENT_D, activeforeground="white", relief="flat",
+                  width=14, height=1, cursor="hand2", font=(UI_FONT, 12, "bold")).pack(side="left", padx=8)
+        tk.Button(brow, text="취소", command=self.cancel, bg="#aab8c4", fg="white",
+                  activebackground="#94a4b2", activeforeground="white", relief="flat",
+                  width=8, cursor="hand2", font=(UI_FONT, 12)).pack(side="left", padx=8)
+
+        self._ready = True
+        self.refresh()
+
+    def _sel(self):
+        try:
+            start = int(self.start_var.get())
+        except ValueError:
+            start = 1
+        return {"start_row": start,
+                "code": self.o2i.get(self.cb["code"].get()),
+                "daejang": self.o2i.get(self.cb["daejang"].get()),
+                "bon": self.o2i.get(self.cb["bon"].get()),
+                "bu": self.o2i.get(self.cb["bu"].get())}
+
+    def refresh(self):
+        if not self._ready:
+            return
+        sel = self._sel()
+        if not (sel["code"] and sel["bon"] and sel["bu"]):
+            self.preview.config(text="(법정동코드/고유번호·본번·부번 열을 골라 주세요)"); return
+        lines, r = [], sel["start_row"]
+        while r <= n_rows(self.grid_data) and len(lines) < 3:
+            code = cell_str(self.grid_data, r, sel["code"])
+            bon = cell_str(self.grid_data, r, sel["bon"])
+            bu = cell_str(self.grid_data, r, sel["bu"])
+            dj = cell_str(self.grid_data, r, sel["daejang"]) if sel["daejang"] else None
+            pnu = pnu_from_parts(code, bon, bu, dj)
+            if pnu:
+                lines.append(f" · {pnu}   (본번 {bon}, 부번 {bu})")
+            r += 1
+        self.preview.config(text="\n".join(lines) if lines else "(만들 PNU가 없습니다 — 열/시작행 확인)")
+
+    def ok(self):
+        sel = self._sel()
+        if not (sel["code"] and sel["bon"] and sel["bu"]):
+            messagebox.showwarning("확인", "법정동코드/고유번호·본번·부번 열을 골라 주세요.", parent=self); return
+        self.result = sel; self.destroy()
+
+    def cancel(self):
+        self.result = None; self.destroy()
+
+
 # ---------- 메인 ----------
 class App:
     def __init__(self, root):
@@ -960,6 +1129,9 @@ class App:
                        command=self._on_engine, bg=CARD, fg=INK, selectcolor=SOFT,
                        activebackground=CARD, font=(UI_FONT, 10), cursor="hand2").pack(side="left", padx=(8, 4))
         tk.Radiobutton(engf, text="VWorld (느림 · 필지·공시지가)", value="vworld", variable=self.engine_var,
+                       command=self._on_engine, bg=CARD, fg=INK, selectcolor=SOFT,
+                       activebackground=CARD, font=(UI_FONT, 10), cursor="hand2").pack(side="left", padx=4)
+        tk.Radiobutton(engf, text="코드 조합 (즉시·무통신)", value="combine", variable=self.engine_var,
                        command=self._on_engine, bg=CARD, fg=INK, selectcolor=SOFT,
                        activebackground=CARD, font=(UI_FONT, 10), cursor="hand2").pack(side="left", padx=4)
 
@@ -1203,6 +1375,8 @@ class App:
 
     def _ensure_keys(self):
         """엔진에 맞는 키가 준비됐는지 확인."""
+        if self._engine() == "combine":
+            return True   # 코드 조합은 통신 없음 → 키 불필요
         if self._engine() == "kakao":
             if not self._kakao_key():
                 messagebox.showinfo("카카오 키 필요",
@@ -1313,6 +1487,24 @@ class App:
 
         if n_rows(head) == 0:
             messagebox.showwarning("빈 파일", "내용이 없는 파일입니다."); return
+
+        if self._engine() == "combine":   # 코드 조합(무통신) — ① PNU 전용
+            if self.tab != 1:
+                messagebox.showinfo("코드 조합", "코드 조합 모드는 ① 주소 → PNU 에서만 됩니다.\n"
+                                    "(좌표·필지는 카카오/VWorld 모드를 쓰세요)")
+                return
+            cdlg = CombineDialog(self.root, head, detect_combine(head))
+            self.root.wait_window(cdlg)
+            if not cdlg.result:
+                self.write("취소되었습니다."); return
+            self._cancel.clear()
+            self.status_lbl.config(text="시작 중…"); self.eta_lbl.config(text="")
+            self._set_running(True)
+            threading.Thread(target=self.run_combine,
+                             args=(path, ext, sheet, enc, raw, cdlg.result),
+                             daemon=True).start()
+            return
+
         detected = detect_layout(head)
         dlg = ColumnDialog(self.root, head, detected)
         self.root.wait_window(dlg)
@@ -1327,6 +1519,49 @@ class App:
         threading.Thread(target=self.run,
                          args=(path, ext, sheet, enc, raw, sel, self.tab, opts),
                          daemon=True).start()
+
+    def run_combine(self, path, ext, sheet, enc, raw, sel):
+        """코드 조합 모드: 법정동/고유번호+본번+부번을 규칙대로 붙여 PNU를 즉시 만든다(통신 없음)."""
+        try:
+            self.write("파일을 읽는 중…")
+            grid_full, truncated = read_full_grid(path, ext, sheet, enc, raw=raw)
+            if truncated:
+                self.write(f"⚠ 너무 많아 {MAX_ROWS:,}행까지만 처리합니다.")
+            base_width = max((len(r) for r in grid_full), default=0)
+            start_row = sel["start_row"]
+            code_c, dj_c, bon_c, bu_c = sel["code"], sel.get("daejang"), sel["bon"], sel["bu"]
+            heads = ["PNU(조합)", "상태"]
+            total = max(0, len(grid_full) - start_row + 1)
+            self._t_start = time.monotonic()
+            self.write(f"PNU 코드 조합: {total:,}건 (통신 없음 · 즉시)")
+            result_by_row = {}
+            ok = bad = 0
+            for r in range(start_row, len(grid_full) + 1):
+                row = grid_full[r - 1]
+                dj = _row_cell(row, dj_c) if dj_c else None
+                pnu = pnu_from_parts(_row_cell(row, code_c), _row_cell(row, bon_c),
+                                     _row_cell(row, bu_c), dj)
+                if pnu and len(pnu) == 19:
+                    ok += 1; st = "OK"
+                else:
+                    bad += 1; st = "코드부족"
+                result_by_row[r] = [pnu, st]
+                if (r - start_row) % 5000 == 0:
+                    self.set_progress(r - start_row + 1, total, phase="조합 중")
+            out_path = os.path.splitext(path)[0] + "_PNU조합.xlsx"
+            self.write("결과 저장 중…")
+            save_with_original(grid_full, base_width, start_row, result_by_row, heads, out_path)
+            self.progress["value"] = self.progress["maximum"]
+            self.status_lbl.config(text="✅ 저장 완료"); self.eta_lbl.config(text="")
+            self.write(f"\n✅ 완료 · 성공 {ok:,} / 코드부족 {bad:,}")
+            self.write(f"저장: {out_path}")
+            messagebox.showinfo("완료",
+                f"성공 {ok:,}건 / 코드부족 {bad:,}건\n\n저장되었습니다:\n{out_path}")
+        except Exception as e:
+            self.write(f"\n[오류] {e}")
+            messagebox.showerror("오류", str(e))
+        finally:
+            self._set_running(False)
 
     def run(self, path, ext, sheet, enc, raw, sel, tab, opts):
         try:
