@@ -41,7 +41,7 @@ MAX_COLS = 60          # 읽어들일 최대 열 수
 HEAD_ROWS = 300        # 미리보기·열 자동인식에 쓸 앞부분 행 수
 REQ_TIMEOUT = 15       # 한 번 호출을 기다리는 최대 시간(초)
 GEO_RETRIES = 5        # 일시적 실패 시 재시도 횟수
-REQ_MIN_INTERVAL = 0.05  # 요청 시작 간 최소 간격(초) — 과도한 동시 접속 방지(대략 초당 ~20건 상한)
+REQ_MIN_INTERVAL = 0.03  # 요청 시작 간 최소 간격(초) — 과도한 동시 접속 방지(대략 초당 ~33건 상한)
 
 SIDO = ["서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시",
         "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "강원도", "충청북도",
@@ -820,6 +820,8 @@ class App:
         global UI_FONT
         self.root = root; self.tab = 1
         self._valid_key = None
+        self._cancel = threading.Event()
+        self._t_start = 0
         UI_FONT = _pick_font(root)
         root.title("GIS 주소 변환기"); root.geometry("720x880"); root.configure(bg=BG)
         try:
@@ -909,26 +911,46 @@ class App:
                        variable=self.pg_var, bg=CARD, fg=INK, activebackground=CARD, selectcolor=SOFT,
                        font=(UI_FONT, 11), cursor="hand2").pack(anchor="w")
 
+        wf = tk.Frame(card, bg=CARD); wf.pack(fill="x", padx=22, pady=(8, 0))
+        tk.Label(wf, text="동시 처리 수:", bg=CARD, fg=INK, font=(UI_FONT, 11)).pack(side="left")
+        self.workers_var = tk.StringVar(value=str(WORKERS_DEFAULT))
+        tk.Spinbox(wf, from_=1, to=POOL_SIZE, width=4, textvariable=self.workers_var,
+                   font=(UI_FONT, 11)).pack(side="left", padx=8)
+        tk.Label(wf, text="느려지거나 '통신실패'가 늘면 낮추세요 (VWorld가 동시 접속을 조입니다). 권장 3~5.",
+                 bg=CARD, fg=MUTED, font=(UI_FONT, 9)).pack(side="left")
+
         self.btn = tk.Button(card, text=PICK_TEXT, command=self.pick,
                              font=(UI_FONT, 13, "bold"), bg=ACCENT, fg="white",
                              activebackground=ACCENT_D, activeforeground="white",
                              relief="flat", height=2, cursor="hand2")
         self.btn.pack(fill="x", padx=22, pady=(16, 8))
 
-        prow = tk.Frame(card, bg=CARD); prow.pack(fill="x", padx=22, pady=(0, 18))
-        self.progress = ttk.Progressbar(prow, style="A.Horizontal.TProgressbar",
+        pbox = tk.Frame(card, bg=CARD); pbox.pack(fill="x", padx=22, pady=(6, 18))
+        self.status_lbl = tk.Label(pbox, text="대기 중", bg=CARD, fg=INK,
+                                   font=(UI_FONT, 12, "bold"), anchor="w")
+        self.status_lbl.pack(fill="x")
+        self.eta_lbl = tk.Label(pbox, text="", bg=CARD, fg=MUTED,
+                                font=(UI_FONT, 10), anchor="w")
+        self.eta_lbl.pack(fill="x", pady=(1, 7))
+        style.configure("Big.Horizontal.TProgressbar", troughcolor="#e6eef5",
+                        background=ACCENT, bordercolor="#e6eef5",
+                        lightcolor=ACCENT, darkcolor=ACCENT, thickness=16)
+        self.progress = ttk.Progressbar(pbox, style="Big.Horizontal.TProgressbar",
                                         mode="determinate", maximum=100)
-        self.progress.pack(side="left", fill="x", expand=True)
-        self.pct_lbl = tk.Label(prow, text="0%", bg=CARD, fg=MUTED, width=18,
-                                font=(UI_FONT, 10))
-        self.pct_lbl.pack(side="left", padx=(10, 0))
+        self.progress.pack(fill="x")
 
-        self.log = scrolledtext.ScrolledText(root, height=10, font=("Consolas", 10),
-                                             bg=LOGBG, fg=INK, relief="flat",
+        logwrap = tk.Frame(root, bg=BG); logwrap.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        tk.Label(logwrap, text="진행 로그", bg=BG, fg=MUTED, font=(UI_FONT, 9),
+                 anchor="w").pack(fill="x", pady=(0, 3))
+        self.log = scrolledtext.ScrolledText(logwrap, height=7, font=(UI_FONT, 9),
+                                             bg=LOGBG, fg=MUTED, relief="flat", padx=8, pady=6,
                                              highlightbackground=LINE, highlightthickness=1)
-        self.log.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        self.log.pack(fill="both", expand=True)
 
         self.cfg = load_config()
+        wcfg = self.cfg.get("WORKERS")
+        if wcfg:
+            self.workers_var.set(str(wcfg))
         self.write(f"UI 글꼴: {UI_FONT}")
         saved = self.cfg.get("API_KEY", "")
         if saved and "여기에" not in saved:
@@ -950,8 +972,8 @@ class App:
 
     def _workers(self):
         try:
-            w = int(self.cfg.get("WORKERS", WORKERS_DEFAULT))
-        except (ValueError, TypeError):
+            w = int(self.workers_var.get())
+        except (ValueError, TypeError, AttributeError, tk.TclError):
             w = WORKERS_DEFAULT
         return max(1, min(POOL_SIZE, w))
 
@@ -976,12 +998,45 @@ class App:
     def write(self, msg):
         self.log.insert("end", msg + "\n"); self.log.see("end"); self.root.update_idletasks()
 
-    def set_progress(self, done, total):
-        total = max(1, total)
+    @staticmethod
+    def _fmt_dur(sec):
+        sec = int(sec)
+        if sec < 60:
+            return f"{sec}초"
+        m, s = divmod(sec, 60)
+        if m < 60:
+            return f"{m}분 {s}초" if s else f"{m}분"
+        h, m = divmod(m, 60)
+        return f"{h}시간 {m}분"
+
+    def set_progress(self, done, total, fails=0, phase="변환 중"):
+        total = max(1, total); done = min(max(0, done), total)
         self.progress["maximum"] = total
         self.progress["value"] = done
-        self.pct_lbl.config(text=f"{int(done / total * 100)}%  ({done:,}/{total:,})")
+        pct = int(done / total * 100)
+        self.status_lbl.config(text=f"{phase}    {done:,} / {total:,}    ({pct}%)")
+        eta = ""
+        if done > 0 and self._t_start and done < total:
+            el = time.monotonic() - self._t_start
+            rate = done / el if el > 0 else 0
+            if rate > 0:
+                eta = f"남은 시간 약 {self._fmt_dur((total - done) / rate)}     "
+        tail = f"실패 {fails:,}" if fails else ("✅ 완료" if done >= total else "")
+        self.eta_lbl.config(text=eta + tail)
         self.root.update_idletasks()
+
+    def _set_running(self, running):
+        if running:
+            self.btn.config(text="⏹  처리 중지 (누르면 취소)", command=self.request_cancel,
+                            bg="#c0685f", activebackground="#a85850", state="normal")
+        else:
+            self.btn.config(text=PICK_TEXT, command=self.pick,
+                            bg=ACCENT, activebackground=ACCENT_D, state="normal")
+
+    def request_cancel(self):
+        self._cancel.set()
+        self.write("⏹ 취소 요청됨 — 지금까지 완료된 것까지 저장할게요…")
+        self.btn.config(text="취소 중…", state="disabled")
 
     def _toggle_key(self):
         self.key_entry.config(show="" if self.show_key.get() else "●")
@@ -1124,8 +1179,9 @@ class App:
         sel = dlg.result
         opts = {"jiga": self.jiga_var.get(), "crs_label": self.crs_cb.get(),
                 "pt": self.pt_var.get(), "pg": self.pg_var.get()}
-        self.set_progress(0, 1)
-        self.btn.config(state="disabled", text="처리 중...")
+        self._cancel.clear()
+        self.status_lbl.config(text="시작 중…"); self.eta_lbl.config(text="")
+        self._set_running(True)
         threading.Thread(target=self.run,
                          args=(path, ext, sheet, enc, raw, sel, self.tab, opts),
                          daemon=True).start()
@@ -1135,6 +1191,7 @@ class App:
             api_key = self.current_key() or self.cfg.get("API_KEY", "").strip()
             domain = self.cfg.get("DOMAIN", "localhost")
             workers = self._workers()
+            set_config_value("WORKERS", str(workers))   # 이번 값 기억
             start_row = sel["start_row"]; prefix = sel.get("prefix", "")
 
             if tab == 3:
@@ -1166,40 +1223,59 @@ class App:
             crs = CRS_OPTIONS[opts["crs_label"]][0] if tab == 2 else "EPSG:4326"
             need_parcel = (tab == 1 and opts["jiga"])
             total = len(valid_rows)
-            self.write(f"변환 시작: {total:,}건 (동시 {workers}개, 건너뜀 {skip:,})")
+
+            # 같은 주소는 한 번만 조회(중복 제거) → 요청 수 절감
+            addr_to_rows = {}
+            for r in valid_rows:
+                addr_to_rows.setdefault(row_addr[r], []).append(r)
+            uniq = len(addr_to_rows)
+            note = f" · 고유주소 {uniq:,}건만 조회" if uniq < total else ""
+            self.write(f"변환 시작: {total:,}건 (동시 {workers}개, 건너뜀 {skip:,}){note}")
 
             results = {}
-            done = 0
+            done = 0; fails = 0
+            self._t_start = time.monotonic()
             self.set_progress(0, total)
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut2r = {ex.submit(work, row_addr[r], api_key, crs, need_parcel, domain): r
-                         for r in valid_rows}
-                for fut in as_completed(fut2r):
-                    results[fut2r[fut]] = fut.result()
-                    done += 1
-                    if done % 100 == 0 or done == total:
-                        self.set_progress(done, total)
-                    if done % 2000 == 0:
-                        self.write(f"  … {done:,}/{total:,}")
+                futs = {ex.submit(work, a, api_key, crs, need_parcel, domain): a
+                        for a in addr_to_rows}
+                comp = 0
+                for fut in as_completed(futs):
+                    a = futs[fut]; item = fut.result()
+                    for r in addr_to_rows[a]:
+                        results[r] = item
+                    if item["status"] != "OK":
+                        fails += len(addr_to_rows[a])
+                    comp += 1; done += len(addr_to_rows[a])
+                    if comp % 30 == 0 or done >= total:
+                        self.set_progress(min(done, total), total, fails)
+                    if self._cancel.is_set():
+                        ex.shutdown(wait=False, cancel_futures=True); break
+            if self._cancel.is_set():
+                self.write("⏹ 취소됨 — 완료분까지 저장합니다.")
 
             self.save_records(path, tab, sel, opts, grid_full, base_width, row_addr, results, valid_rows, skip)
         except Exception as e:
             self.write(f"\n[오류] {e}")
             messagebox.showerror("오류", str(e))
         finally:
-            self.btn.config(state="normal", text=PICK_TEXT)
+            self._set_running(False)
 
     def save_records(self, path, tab, sel, opts, grid_full, base_width, row_addr, results, valid_rows, skip):
         start_row = sel["start_row"]
-        ok = fail = commfail = 0
+        ok = fail = commfail = undone = 0
         result_by_row = {}
         if tab == 1:
             want_jiga = opts["jiga"]
             heads = (["입력주소", "PNU", "정제주소", "본번", "부번"]
                      + (["공시지가(원/㎡)", "기준연월"] if want_jiga else []) + ["상태"])
             for r in valid_rows:
-                item = results.get(r) or {"status": "실패", "pnu": None, "refined": None}
+                item = results.get(r)
+                if item is None:   # 취소로 아직 처리 안 된 행
+                    undone += 1
+                    result_by_row[r] = [row_addr[r]] + [None] * (len(heads) - 2) + ["미처리"]
+                    continue
                 status = item["status"]; pnu = item["pnu"]
                 st_ = "PNU불완전" if (status == "OK" and not (pnu and len(pnu) == 19)) else status
                 if status == "OK":
@@ -1221,7 +1297,11 @@ class App:
             xlab, ylab = CRS_OPTIONS[opts["crs_label"]][1], CRS_OPTIONS[opts["crs_label"]][2]
             heads = ["입력주소", xlab, ylab, "정제주소", "상태"]
             for r in valid_rows:
-                item = results.get(r) or {"status": "실패", "x": None, "y": None, "refined": None}
+                item = results.get(r)
+                if item is None:   # 취소로 아직 처리 안 된 행
+                    undone += 1
+                    result_by_row[r] = [row_addr[r], None, None, None, "미처리"]
+                    continue
                 status = item["status"]
                 if status == "OK":
                     ok += 1
@@ -1234,14 +1314,17 @@ class App:
         out_path = os.path.splitext(path)[0] + "_결과.xlsx"
         self.write("결과 저장 중…")
         save_with_original(grid_full, base_width, start_row, result_by_row, heads, out_path)
-        self.set_progress(1, 1)
-        self.write(f"\n✅ 완료 · 성공 {ok:,} / 실패 {fail:,} / 건너뜀 {skip:,}")
+        self.progress["value"] = self.progress["maximum"]
+        done_word = "취소 — 완료분 저장" if undone else "저장 완료"
+        self.status_lbl.config(text=f"✅ {done_word}"); self.eta_lbl.config(text="")
+        undone_txt = f" / 미처리 {undone:,}" if undone else ""
+        self.write(f"\n✅ 완료 · 성공 {ok:,} / 실패 {fail:,} / 건너뜀 {skip:,}{undone_txt}")
         if commfail:
             self.write(f"※ 통신실패 {commfail:,}건 — VWorld 연결이 조여졌을 수 있어요. "
-                       f"config.txt 의 WORKERS 를 줄이거나(예: {max(1, self._workers()-1)}) 잠시 뒤 실패분만 다시 돌려 보세요.")
+                       f"동시 처리 수를 줄이거나(예: {max(1, self._workers()-1)}) 잠시 뒤 실패분만 다시 돌려 보세요.")
         self.write(f"저장: {out_path}")
         messagebox.showinfo("완료",
-            f"성공 {ok:,}건 / 실패 {fail:,}건 / 건너뜀 {skip:,}건\n\n저장되었습니다:\n{out_path}")
+            f"성공 {ok:,}건 / 실패 {fail:,}건 / 건너뜀 {skip:,}{undone_txt}\n\n저장되었습니다:\n{out_path}")
 
     def run_layers(self, path, ext, sheet, enc, raw, sel, opts, api_key, domain, workers):
         start_row = sel["start_row"]; prefix = sel.get("prefix", "")
@@ -1258,24 +1341,38 @@ class App:
         want_pt, want_pg = opts["pt"], opts["pg"]
         total = len(valid)
         self.write(f"변환 시작: {total:,}건 (동시 {workers}개, 건너뜀 {skip:,})")
+        # 같은 주소는 한 번만 조회(중복 제거)
+        addr_to_pos = {}
+        for p, a in enumerate(valid):
+            addr_to_pos.setdefault(a, []).append(p)
         results = [None] * total
-        done = 0
+        done = 0; fails = 0
+        self._t_start = time.monotonic()
         self.set_progress(0, total)
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut2pos = {ex.submit(work, a, api_key, "EPSG:4326", want_pg, domain): p
-                       for p, a in enumerate(valid)}
-            for fut in as_completed(fut2pos):
-                results[fut2pos[fut]] = fut.result()
-                done += 1
-                if done % 100 == 0 or done == total:
-                    self.set_progress(done, total)
-                if done % 2000 == 0:
-                    self.write(f"  … {done:,}/{total:,}")
+            futs = {ex.submit(work, a, api_key, "EPSG:4326", want_pg, domain): a
+                    for a in addr_to_pos}
+            comp = 0
+            for fut in as_completed(futs):
+                a = futs[fut]; item = fut.result()
+                for p in addr_to_pos[a]:
+                    results[p] = item
+                if item["status"] != "OK":
+                    fails += len(addr_to_pos[a])
+                comp += 1; done += len(addr_to_pos[a])
+                if comp % 30 == 0 or done >= total:
+                    self.set_progress(min(done, total), total, fails)
+                if self._cancel.is_set():
+                    ex.shutdown(wait=False, cancel_futures=True); break
+        if self._cancel.is_set():
+            self.write("⏹ 취소됨 — 완료분까지 저장합니다.")
 
         pts, pgs = [], []
         ok = fail = 0
         for item in results:
+            if item is None:
+                continue
             status = item["status"]; x = item["x"]; y = item["y"]
             pnu = item["pnu"]; refined = item["refined"]; addr = item["addr"]
             if status != "OK" or not x:
@@ -1309,7 +1406,8 @@ class App:
                 json.dump({"type": "FeatureCollection", "features": pgs}, f, ensure_ascii=False)
             saved.append(p)
 
-        self.set_progress(1, 1)
+        self.progress["value"] = self.progress["maximum"]
+        self.status_lbl.config(text="✅ 저장 완료"); self.eta_lbl.config(text="")
         self.write(f"\n✅ 완료 · 성공 {ok:,} / 실패 {fail:,}")
         for s in saved:
             self.write("저장: " + s)
