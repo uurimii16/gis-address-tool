@@ -33,6 +33,7 @@ from openpyxl import load_workbook, Workbook
 
 GEOCODE_URL = "https://api.vworld.kr/req/address"
 DATA_URL = "https://api.vworld.kr/req/data"
+KAKAO_URL = "https://dapi.kakao.com/v2/local/search/address.json"
 
 WORKERS_DEFAULT = 4    # 동시에 물어보는 주소 개수(기본). config.txt WORKERS 로 조절.
 POOL_SIZE = 16         # 커넥션 풀 상한(WORKERS 를 나중에 키워도 되도록 넉넉히)
@@ -288,9 +289,73 @@ def get_parcel(x, y, api_key, domain="localhost", retries=4):
     return None, None
 
 
-def work(addr, api_key, crs, need_parcel, domain):
-    """병렬 실행 단위: 한 주소의 지오코딩(+필요시 필지)을 묶어 처리."""
-    pnu, x, y, refined, status = geocode(addr, api_key, crs)
+def validate_kakao(kakao_key):
+    """카카오 REST 키 유효성 확인 → 'ok' · 'invalid' · 'network'."""
+    try:
+        r = _session.get(KAKAO_URL, params={"query": "서울특별시 중구 세종대로 110", "size": 1},
+                         headers={"Authorization": f"KakaoAK {kakao_key}"}, timeout=8)
+    except requests.RequestException as e:
+        return "network", type(e).__name__
+    if r.status_code in (401, 403):
+        return "invalid", f"HTTP{r.status_code}"
+    if r.status_code != 200:
+        return "network", f"HTTP{r.status_code}"
+    return "ok", ""
+
+
+def geocode_kakao(addr, kakao_key, retries=3):
+    """카카오 주소검색 → (pnu, x, y, refined, status). VWorld geocode 와 같은 형식.
+    카카오 응답의 b_code(법정동)+mountain_yn+본번+부번으로 19자리 PNU를 만든다. 좌표는 WGS84."""
+    headers = {"Authorization": f"KakaoAK {kakao_key}"}
+    last = "실패"
+    for attempt in range(retries):
+        _rate_gate()
+        try:
+            r = _session.get(KAKAO_URL, params={"query": addr, "size": 1},
+                             headers=headers, timeout=REQ_TIMEOUT)
+        except requests.RequestException as e:
+            last = "연결실패:" + type(e).__name__
+            if attempt < retries - 1:
+                time.sleep(_backoff(attempt)); continue
+            return None, None, None, None, f"통신실패:{last}"
+        if r.status_code in (401, 403):
+            return None, None, None, None, "인증키오류"
+        if r.status_code != 200:
+            last = f"HTTP{r.status_code}"
+            if attempt < retries - 1:
+                time.sleep(_backoff(attempt)); continue
+            return None, None, None, None, f"통신실패:{last}"
+        try:
+            docs = (r.json().get("documents") or [])
+        except ValueError:
+            last = "비정상응답"
+            if attempt < retries - 1:
+                time.sleep(_backoff(attempt)); continue
+            return None, None, None, None, f"통신실패:{last}"
+        if not docs:
+            return None, None, None, None, "주소인식실패"
+        d = docs[0]
+        a = d.get("address") or {}
+        refined = d.get("address_name") or a.get("address_name", "")
+        x, y = d.get("x"), d.get("y")
+        b = str(a.get("b_code") or "")
+        pnu = ""
+        if len(b) == 10:
+            flag = "2" if a.get("mountain_yn") == "Y" else "1"
+            mn = "".join(c for c in str(a.get("main_address_no", "")) if c.isdigit()).zfill(4)
+            sb = "".join(c for c in str(a.get("sub_address_no", "")) if c.isdigit()).zfill(4)
+            pnu = b + flag + mn + sb
+        return pnu, x, y, refined, "OK"
+    return None, None, None, None, f"통신실패:{last}"
+
+
+def work(addr, api_key, crs, need_parcel, domain, engine="vworld", kakao_key=""):
+    """병렬 실행 단위: 한 주소의 지오코딩(+필요시 필지)을 묶어 처리.
+    engine='kakao'면 카카오로 PNU·좌표를 뽑고(빠름), 필지/공시지가는 VWorld(get_parcel)만 지원."""
+    if engine == "kakao":
+        pnu, x, y, refined, status = geocode_kakao(addr, kakao_key)
+    else:
+        pnu, x, y, refined, status = geocode(addr, api_key, crs)
     item = {"addr": addr, "status": status, "pnu": pnu, "x": x, "y": y, "refined": refined}
     if need_parcel and status == "OK" and x:
         item["geom"], item["props"] = get_parcel(x, y, api_key, domain)
@@ -885,6 +950,32 @@ class App:
         tk.Button(khelp, text="vworld.kr 열기", relief="flat", bg=CARD, fg=ACCENT_D,
                   activebackground=CARD, cursor="hand2", font=(UI_FONT, 9, "underline"),
                   command=lambda: webbrowser.open("https://www.vworld.kr")).pack(side="left")
+        tk.Frame(card, bg=LINE, height=1).pack(fill="x", padx=22, pady=(8, 6))
+
+        # 변환 엔진 선택
+        engf = tk.Frame(card, bg=CARD); engf.pack(fill="x", padx=22)
+        tk.Label(engf, text="변환 엔진:", bg=CARD, fg=INK, font=(UI_FONT, 11, "bold")).pack(side="left")
+        self.engine_var = tk.StringVar(value="vworld")
+        tk.Radiobutton(engf, text="카카오 (빠름 · PNU·좌표)", value="kakao", variable=self.engine_var,
+                       command=self._on_engine, bg=CARD, fg=INK, selectcolor=SOFT,
+                       activebackground=CARD, font=(UI_FONT, 10), cursor="hand2").pack(side="left", padx=(8, 4))
+        tk.Radiobutton(engf, text="VWorld (느림 · 필지·공시지가)", value="vworld", variable=self.engine_var,
+                       command=self._on_engine, bg=CARD, fg=INK, selectcolor=SOFT,
+                       activebackground=CARD, font=(UI_FONT, 10), cursor="hand2").pack(side="left", padx=4)
+
+        # 카카오 REST 키
+        kakf = tk.Frame(card, bg=CARD); kakf.pack(fill="x", padx=22, pady=(4, 0))
+        krow2 = tk.Frame(kakf, bg=CARD); krow2.pack(fill="x")
+        tk.Label(krow2, text="🟡 카카오 REST 키", bg=CARD, fg=INK, font=(UI_FONT, 10, "bold")).pack(side="left")
+        self.kakao_var = tk.StringVar(value="")
+        self.kakao_entry = tk.Entry(krow2, textvariable=self.kakao_var, show="●",
+                                    font=(UI_FONT, 10), relief="solid", bd=1)
+        self.kakao_entry.pack(side="left", fill="x", expand=True, ipady=2, padx=(8, 6))
+        tk.Button(krow2, text="확인·저장", command=self.verify_and_save_kakao, bg=ACCENT, fg="white",
+                  activebackground=ACCENT_D, activeforeground="white", relief="flat",
+                  font=(UI_FONT, 9, "bold"), cursor="hand2").pack(side="left")
+        self.kakao_status = tk.Label(kakf, text="", bg=CARD, fg=MUTED, font=(UI_FONT, 9), anchor="w")
+        self.kakao_status.pack(anchor="w", pady=(3, 0))
         tk.Frame(card, bg=LINE, height=1).pack(fill="x", padx=22, pady=(8, 2))
 
         self.desc = tk.Label(card, text="", bg=CARD, fg=INK, justify="left", anchor="w",
@@ -951,6 +1042,13 @@ class App:
         wcfg = self.cfg.get("WORKERS")
         if wcfg:
             self.workers_var.set(str(wcfg))
+        eng = self.cfg.get("ENGINE")
+        if eng in ("kakao", "vworld"):
+            self.engine_var.set(eng)
+        kk = self.cfg.get("KAKAO_KEY", "")
+        if kk and "여기에" not in kk:
+            self.kakao_var.set(kk.strip())
+            self.kakao_status.config(text="✅ 저장된 카카오 키를 불러왔어요.", fg="#2e7d32")
         self.write(f"UI 글꼴: {UI_FONT}")
         saved = self.cfg.get("API_KEY", "")
         if saved and "여기에" not in saved:
@@ -1072,6 +1170,51 @@ class App:
         self._set_key_status("ok")
         self.write("✔ 인증키 저장 완료.")
 
+    def _engine(self):
+        try:
+            return self.engine_var.get()
+        except Exception:
+            return "vworld"
+
+    def _kakao_key(self):
+        try:
+            return self.kakao_var.get().strip()
+        except Exception:
+            return ""
+
+    def _on_engine(self):
+        set_config_value("ENGINE", self._engine())
+
+    def verify_and_save_kakao(self):
+        key = self._kakao_key()
+        if not key:
+            self.kakao_status.config(text="카카오 REST 키를 붙여넣고 눌러 주세요.", fg=MUTED); return
+        self.kakao_status.config(text="확인 중…", fg=MUTED); self.root.update_idletasks()
+        status, _detail = validate_kakao(key)
+        if status == "invalid":
+            self.kakao_status.config(text="❌ 카카오 키가 올바르지 않아요 (또는 카카오맵 활성화 필요).",
+                                     fg="#c0392b"); return
+        if status == "network":
+            self.kakao_status.config(text="⚠️ 지금 연결이 안 돼 확인 못 했어요. 잠시 뒤 다시.", fg="#b9770e"); return
+        set_config_value("KAKAO_KEY", key)
+        self.cfg = load_config()
+        self.kakao_status.config(text="✅ 카카오 키 정상 — 저장했어요.", fg="#2e7d32")
+        self.write("✔ 카카오 키 저장 완료.")
+
+    def _ensure_keys(self):
+        """엔진에 맞는 키가 준비됐는지 확인."""
+        if self._engine() == "kakao":
+            if not self._kakao_key():
+                messagebox.showinfo("카카오 키 필요",
+                    "카카오 REST 키를 붙여넣고 [확인·저장]을 눌러 주세요.")
+                try:
+                    self.kakao_entry.focus_set()
+                except Exception:
+                    pass
+                return False
+            return True
+        return self.check_api_key() is not None
+
     def check_api_key(self):
         """인증키 칸의 값을 확인·저장하고 유효하면 반환, 아니면 안내 후 None."""
         key = self.current_key()
@@ -1132,8 +1275,7 @@ class App:
         self.root.after(0, lambda: self.start_with_file(paths[0]))
 
     def start_with_file(self, path):
-        api_key = self.check_api_key()
-        if api_key is None:
+        if not self._ensure_keys():
             return
         ext = path.lower().rsplit(".", 1)[-1]
         raw = None; enc = None; sheet = None
@@ -1190,9 +1332,12 @@ class App:
         try:
             api_key = self.current_key() or self.cfg.get("API_KEY", "").strip()
             domain = self.cfg.get("DOMAIN", "localhost")
+            engine = self._engine(); kakao_key = self._kakao_key()
             workers = self._workers()
             set_config_value("WORKERS", str(workers))   # 이번 값 기억
             start_row = sel["start_row"]; prefix = sel.get("prefix", "")
+            if engine == "kakao" and tab == 2:
+                opts = dict(opts); opts["crs_label"] = list(CRS_OPTIONS)[0]  # 카카오는 위경도만
 
             if tab == 3:
                 if not (opts["pt"] or opts["pg"]):
@@ -1221,7 +1366,9 @@ class App:
                 return
 
             crs = CRS_OPTIONS[opts["crs_label"]][0] if tab == 2 else "EPSG:4326"
-            need_parcel = (tab == 1 and opts["jiga"])
+            need_parcel = (tab == 1 and opts["jiga"] and engine == "vworld")
+            if engine == "kakao" and tab == 1 and opts["jiga"]:
+                self.write("※ 카카오 모드는 공시지가 미지원 — PNU/좌표만 뽑아요(필요하면 VWorld 모드).")
             total = len(valid_rows)
 
             # 같은 주소는 한 번만 조회(중복 제거) → 요청 수 절감
@@ -1230,7 +1377,8 @@ class App:
                 addr_to_rows.setdefault(row_addr[r], []).append(r)
             uniq = len(addr_to_rows)
             note = f" · 고유주소 {uniq:,}건만 조회" if uniq < total else ""
-            self.write(f"변환 시작: {total:,}건 (동시 {workers}개, 건너뜀 {skip:,}){note}")
+            eng_txt = "카카오" if engine == "kakao" else "VWorld"
+            self.write(f"변환 시작: {total:,}건 · {eng_txt} · 동시 {workers}개 · 건너뜀 {skip:,}{note}")
 
             results = {}
             done = 0; fails = 0
@@ -1238,7 +1386,7 @@ class App:
             self.set_progress(0, total)
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(work, a, api_key, crs, need_parcel, domain): a
+                futs = {ex.submit(work, a, api_key, crs, need_parcel, domain, engine, kakao_key): a
                         for a in addr_to_rows}
                 comp = 0
                 for fut in as_completed(futs):
@@ -1339,8 +1487,13 @@ class App:
             messagebox.showwarning("확인", "주소를 찾지 못했습니다."); return
 
         want_pt, want_pg = opts["pt"], opts["pg"]
+        engine = self._engine(); kakao_key = self._kakao_key()
+        need_pg = want_pg and engine == "vworld"
+        if want_pg and engine == "kakao":
+            self.write("※ 카카오 모드는 필지 경계 미지원 — 포인트만 만듭니다(필지는 VWorld 모드).")
         total = len(valid)
-        self.write(f"변환 시작: {total:,}건 (동시 {workers}개, 건너뜀 {skip:,})")
+        eng_txt = "카카오" if engine == "kakao" else "VWorld"
+        self.write(f"변환 시작: {total:,}건 · {eng_txt} · 동시 {workers}개 · 건너뜀 {skip:,}")
         # 같은 주소는 한 번만 조회(중복 제거)
         addr_to_pos = {}
         for p, a in enumerate(valid):
@@ -1351,7 +1504,7 @@ class App:
         self.set_progress(0, total)
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(work, a, api_key, "EPSG:4326", want_pg, domain): a
+            futs = {ex.submit(work, a, api_key, "EPSG:4326", need_pg, domain, engine, kakao_key): a
                     for a in addr_to_pos}
             comp = 0
             for fut in as_completed(futs):
