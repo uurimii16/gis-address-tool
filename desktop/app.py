@@ -23,6 +23,7 @@ import json
 import time
 import random
 import threading
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -161,6 +162,25 @@ def load_config():
             k, v = line.split("=", 1)
             cfg[k.strip()] = v.strip()
     return cfg
+
+
+def set_config_value(key, value):
+    """config.txt 의 한 항목(예: API_KEY)만 갱신하고 나머지(주석·다른 설정)는 보존한다."""
+    path = config_path()
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_CONFIG)
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    found = False
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s and s.split("=", 1)[0].strip() == key:
+            lines[i] = f"{key}={value}"; found = True; break
+    if not found:
+        lines.append(f"{key}={value}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def idx_to_col(i):
@@ -801,7 +821,7 @@ class App:
         self.root = root; self.tab = 1
         self._valid_key = None
         UI_FONT = _pick_font(root)
-        root.title("GIS 주소 변환기"); root.geometry("700x760"); root.configure(bg=BG)
+        root.title("GIS 주소 변환기"); root.geometry("720x880"); root.configure(bg=BG)
         try:
             root.iconbitmap(resource_path("icon.ico"))
         except Exception:
@@ -838,9 +858,36 @@ class App:
         card = tk.Frame(root, bg=CARD, highlightbackground=LINE, highlightthickness=1)
         card.pack(fill="x", padx=18, pady=14)
         self.card = card
+
+        # 🔑 인증키 입력 — 앱에서 바로 붙여넣고 저장 (파일 편집 불필요)
+        keyf = tk.Frame(card, bg=CARD); keyf.pack(fill="x", padx=22, pady=(16, 4))
+        tk.Label(keyf, text="🔑 VWorld 인증키", bg=CARD, fg=INK,
+                 font=(UI_FONT, 11, "bold")).pack(anchor="w")
+        krow = tk.Frame(keyf, bg=CARD); krow.pack(fill="x", pady=(4, 0))
+        self.key_var = tk.StringVar(value="")
+        self.key_entry = tk.Entry(krow, textvariable=self.key_var, show="●",
+                                  font=(UI_FONT, 11), relief="solid", bd=1)
+        self.key_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self.show_key = tk.BooleanVar(value=False)
+        tk.Checkbutton(krow, text="보기", variable=self.show_key, command=self._toggle_key,
+                       bg=CARD, fg=MUTED, activebackground=CARD, selectcolor=SOFT,
+                       font=(UI_FONT, 9)).pack(side="left", padx=6)
+        tk.Button(krow, text="확인·저장", command=self.verify_and_save, bg=ACCENT, fg="white",
+                  activebackground=ACCENT_D, activeforeground="white", relief="flat",
+                  font=(UI_FONT, 10, "bold"), cursor="hand2").pack(side="left", padx=(4, 0))
+        self.key_status = tk.Label(keyf, text="", bg=CARD, fg=MUTED, font=(UI_FONT, 10), anchor="w")
+        self.key_status.pack(anchor="w", pady=(5, 0))
+        khelp = tk.Frame(keyf, bg=CARD); khelp.pack(anchor="w")
+        tk.Label(khelp, text="키가 없으면 무료 발급 후 여기에 붙여넣고 [확인·저장] →",
+                 bg=CARD, fg=MUTED, font=(UI_FONT, 9)).pack(side="left")
+        tk.Button(khelp, text="vworld.kr 열기", relief="flat", bg=CARD, fg=ACCENT_D,
+                  activebackground=CARD, cursor="hand2", font=(UI_FONT, 9, "underline"),
+                  command=lambda: webbrowser.open("https://www.vworld.kr")).pack(side="left")
+        tk.Frame(card, bg=LINE, height=1).pack(fill="x", padx=22, pady=(8, 2))
+
         self.desc = tk.Label(card, text="", bg=CARD, fg=INK, justify="left", anchor="w",
                              font=(UI_FONT, 11), wraplength=620)
-        self.desc.pack(fill="x", padx=22, pady=(18, 8))
+        self.desc.pack(fill="x", padx=22, pady=(10, 8))
 
         self.opt_area = tk.Frame(card, bg=CARD); self.opt_area.pack(fill="x", padx=22)
         self.jiga_var = tk.BooleanVar(value=False)
@@ -882,12 +929,15 @@ class App:
         self.log.pack(fill="both", expand=True, padx=18, pady=(0, 16))
 
         self.cfg = load_config()
-        self.write(f"설정 파일: {config_path()}")
         self.write(f"UI 글꼴: {UI_FONT}")
-        if "여기에" in self.cfg.get("API_KEY", "여기에"):
-            self.write("⚠ config.txt 의 API_KEY 를 본인 키로 바꿔 주세요.")
+        saved = self.cfg.get("API_KEY", "")
+        if saved and "여기에" not in saved:
+            self.key_var.set(saved.strip())
+            self._set_key_status("saved")
+            self.write("✔ 저장된 인증키를 불러왔어요. 기능을 고르고 파일을 올려 주세요.")
         else:
-            self.write("✔ 준비되었습니다. 기능을 고른 뒤 xlsx/csv 파일을 선택하거나 창으로 끌어다 놓아 주세요.")
+            self._set_key_status("empty")
+            self.write("👉 먼저 위쪽 '인증키' 칸에 VWorld 인증키를 붙여넣고 [확인·저장]을 눌러 주세요.")
         self.write(f"※ 동시 처리 {self._workers()}개(config.txt WORKERS). 통신실패가 많으면 값을 줄여 보세요.")
         self.switch(1)
 
@@ -933,31 +983,76 @@ class App:
         self.pct_lbl.config(text=f"{int(done / total * 100)}%  ({done:,}/{total:,})")
         self.root.update_idletasks()
 
-    def check_api_key(self):
+    def _toggle_key(self):
+        self.key_entry.config(show="" if self.show_key.get() else "●")
+
+    def _set_key_status(self, kind, msg=""):
+        styles = {
+            "ok": ("✅ 인증키 정상 — 저장했어요. 바로 쓸 수 있습니다.", "#2e7d32"),
+            "saved": ("✅ 저장된 인증키를 불러왔어요.", "#2e7d32"),
+            "checking": ("인증키 확인 중…", MUTED),
+            "invalid": ("❌ 인증키가 올바르지 않아요. 다시 붙여넣어 확인해 주세요.", "#c0392b"),
+            "network": ("⚠️ 지금 VWorld 연결이 안 돼 확인 못 했어요. 잠시 뒤 다시 눌러 주세요.", "#b9770e"),
+            "empty": ("인증키를 붙여넣고 [확인·저장]을 눌러 주세요.", MUTED),
+        }
+        text, color = styles.get(kind, ("", MUTED))
+        self.key_status.config(text=msg or text, fg=color)
+
+    def current_key(self):
+        return self.key_var.get().strip()
+
+    def verify_and_save(self):
+        key = self.current_key()
+        if not key:
+            self._set_key_status("empty"); return
+        self._set_key_status("checking"); self.root.update_idletasks()
+        status, _detail = validate_key(key)
+        if status == "invalid":
+            self._valid_key = None; self._set_key_status("invalid"); return
+        if status == "network":
+            self._set_key_status("network"); return
+        set_config_value("API_KEY", key)
         self.cfg = load_config()
-        api_key = self.cfg.get("API_KEY", "")
-        if not api_key or "여기에" in api_key:
-            messagebox.showwarning("설정 필요",
-                "config.txt 파일을 열어 API_KEY 를 본인 VWorld 인증키로 바꿔 주세요.")
-            os.startfile(config_path()); return None
-        api_key = api_key.strip()
-        if self._valid_key == api_key:
-            return api_key
+        self._valid_key = key
+        self._set_key_status("ok")
+        self.write("✔ 인증키 저장 완료.")
+
+    def check_api_key(self):
+        """인증키 칸의 값을 확인·저장하고 유효하면 반환, 아니면 안내 후 None."""
+        key = self.current_key()
+        if not key:   # 칸이 비었으면 저장돼 있던 키라도 불러온다
+            self.cfg = load_config()
+            saved = self.cfg.get("API_KEY", "")
+            if saved and "여기에" not in saved:
+                key = saved.strip(); self.key_var.set(key)
+        if not key or "여기에" in key:
+            messagebox.showinfo("인증키 필요",
+                "먼저 위쪽 '인증키' 칸에 VWorld 인증키를 붙여넣고 [확인·저장]을 눌러 주세요.")
+            try:
+                self.key_entry.focus_set()
+            except Exception:
+                pass
+            self._set_key_status("empty"); return None
+        if self._valid_key == key:
+            return key
         self.write("인증키 확인 중…")
-        status, _detail = validate_key(api_key)
+        status, _detail = validate_key(key)
         if status == "invalid":
             messagebox.showerror("인증키 오류",
-                "VWorld 인증키가 올바르지 않습니다.\nconfig.txt 의 API_KEY 를 확인해 주세요.")
-            os.startfile(config_path()); return None
+                "VWorld 인증키가 올바르지 않습니다. 위쪽 칸에서 다시 확인해 주세요.")
+            self._set_key_status("invalid"); return None
         if status == "network":
             if not messagebox.askokcancel("연결 확인",
                     "지금 VWorld에 연결이 안 돼 인증키를 확인하지 못했습니다.\n그래도 진행할까요?"):
                 return None
             self.write("⚠ 인증키 확인 못함(연결). 그대로 진행합니다.")
-            return api_key
-        self._valid_key = api_key
+            return key
+        set_config_value("API_KEY", key)
+        self.cfg = load_config()
+        self._valid_key = key
+        self._set_key_status("ok")
         self.write("✔ 인증키 정상")
-        return api_key
+        return key
 
     def pick(self):
         if self.check_api_key() is None:
@@ -1037,7 +1132,7 @@ class App:
 
     def run(self, path, ext, sheet, enc, raw, sel, tab, opts):
         try:
-            api_key = self.cfg.get("API_KEY", "").strip()
+            api_key = self.current_key() or self.cfg.get("API_KEY", "").strip()
             domain = self.cfg.get("DOMAIN", "localhost")
             workers = self._workers()
             start_row = sel["start_row"]; prefix = sel.get("prefix", "")
