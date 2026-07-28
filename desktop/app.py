@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-GIS 주소 변환기 (데스크톱) · v8  ── 대용량 안정 병렬 + 원본열 보존 + 파일 미리보기
+GIS 주소 변환기 (데스크톱) · v9  ── 대용량 안정 병렬 + 원본열 보존 + 파일 미리보기
  기능 ① 주소 → PNU   (정제주소·본번·부번, 공시지가 옵션)
  기능 ② 주소 → 좌표  (위경도 또는 중부원점TM)
  기능 ③ QGIS 레이어  (포인트·필지 경계 GeoJSON)
+
+정확도(v9에서 보강):
+ · 대장구분(산/일반) 열을 지정하면 산 지번을 '산 24-4' 로 조회한다. 이걸 빼면 실패하거나
+   같은 번호의 '일반' 필지에 조용히 잘못 매칭된다(실측 29,566행에서 1,177 실패 + 345 오답).
+ · 결과 PNU 11번째 자리(1=일반·2=산)를 대장구분과 교차 검증 → 어긋나면 버리고 '산일반불일치'.
+ · 카카오가 못 찾은 주소는 VWorld 로 한 번 더 조회('OK(VWorld)'). 카카오는 도로명주소 DB 기반이라
+   도로·구거 같은 미등록 지번이 통째로 빠진다.
 
 대용량 안정성(핵심):
  · 동시 조회 수는 config.txt 의 WORKERS(기본 4). 너무 크면 VWorld가 연결을 끊어 실패↑ → 작게 시작.
@@ -109,6 +116,9 @@ _session.mount("http://", _adapter)
 _rate_lock = threading.Lock()
 _last_req = {"t": 0.0}
 
+# VWorld 폴백 차단 스위치: VWorld 키가 없거나 틀리면 한 번 확인 후 더 안 부른다.
+_vw_fallback_off = threading.Event()
+
 
 def _rate_gate():
     with _rate_lock:
@@ -198,6 +208,22 @@ def parse_bonbu(pnu):
     return None, None
 
 
+def is_ok(status):
+    """성공 상태인지. 'OK' 와 'OK(VWorld)' 같은 보완 성공을 함께 인정."""
+    return str(status).startswith("OK")
+
+
+def is_san_value(v):
+    """대장구분·산여부 셀이 '산(임야대장)'을 뜻하는지.
+    '산'·'임야'·'Y'·코드 '2' 를 산으로 본다('일반'·'토지'·'1' 은 아님)."""
+    s = str(v or "").strip()
+    if not s:
+        return False
+    if s in ("2", "Y", "y"):
+        return True
+    return ("산" in s) or ("임야" in s)
+
+
 def pnu_from_parts(code_val, bon, bu, daejang_val=None):
     """규칙대로 19자리 PNU를 즉시 조립(통신 없음).
     code_val = 법정동코드(10) 또는 고유번호(19, 앞10 사용).
@@ -208,8 +234,7 @@ def pnu_from_parts(code_val, bon, bu, daejang_val=None):
         bjd, flag = code[:10], code[10]
     elif len(code) >= 10:
         bjd = code[:10]
-        d = str(daejang_val or "")
-        flag = "2" if ("산" in d or "임야" in d) else "1"
+        flag = "2" if is_san_value(daejang_val) else "1"
     else:
         return ""
     if flag not in ("1", "2"):
@@ -253,6 +278,12 @@ def validate_key(api_key):
     if ("KEY" in code or code in {"020", "021"} or "인증키" in text or "등록되지" in text):
         return "invalid", f"{code} {text}".strip()
     return "ok", ""
+
+
+def usable_vworld_key(api_key):
+    """VWorld 키가 '있어 보이는지'만 싸게 확인(형식만, 통신 없음)."""
+    k = str(api_key or "").strip()
+    return len(k) >= 20 and "여기에" not in k
 
 
 def _backoff(attempt):
@@ -370,15 +401,39 @@ def geocode_kakao(addr, kakao_key, retries=3):
     return None, None, None, None, f"통신실패:{last}"
 
 
-def work(addr, api_key, crs, need_parcel, domain, engine="vworld", kakao_key=""):
+_SAN_RE = re.compile(r"(^|\s)산\s*\d")
+
+
+def addr_is_san(addr):
+    """주소 문자열이 산 지번인지('… 산 24-4')."""
+    return bool(_SAN_RE.search(str(addr or "")))
+
+
+def work(addr, api_key, crs, need_parcel, domain, engine="vworld", kakao_key="",
+         fallback=True, san_check=False):
     """병렬 실행 단위: 한 주소의 지오코딩(+필요시 필지)을 묶어 처리.
-    engine='kakao'면 카카오로 PNU·좌표를 뽑고(빠름), 필지/공시지가는 VWorld(get_parcel)만 지원."""
+    engine='kakao'면 카카오로 PNU·좌표를 뽑고(빠름), 필지/공시지가는 VWorld(get_parcel)만 지원.
+    fallback=True면 카카오가 못 찾은 주소만 VWorld로 한 번 더 조회한다.
+    (카카오는 도로명주소 DB 기반이라 도로·구거 같은 미등록 지번이 통째로 빠진다 → VWorld가 일부 보완)"""
     if engine == "kakao":
         pnu, x, y, refined, status = geocode_kakao(addr, kakao_key)
+        if (fallback and not is_ok(status) and status != "인증키오류"
+                and api_key and not _vw_fallback_off.is_set()):
+            p2, x2, y2, r2, st2 = geocode(addr, api_key, crs)
+            if is_ok(st2):
+                pnu, x, y, refined, status = p2, x2, y2, r2, "OK(VWorld)"
+            elif st2 == "인증키오류":
+                _vw_fallback_off.set()   # VWorld 키가 없거나 틀림 → 헛된 재조회 중단
     else:
         pnu, x, y, refined, status = geocode(addr, api_key, crs)
+    # 산/일반 교차 검증: 대장구분을 아는 경우, 지오코더가 반대쪽 필지를 물어오면 버린다.
+    # (PNU 11번째 자리 1=일반·2=산. 산 24-4 를 일반 24-4 로 매칭해 주는 조용한 오답을 막는다)
+    if san_check and is_ok(status) and pnu and len(pnu) == 19:
+        if pnu[10] != ("2" if addr_is_san(addr) else "1"):
+            pnu = x = y = refined = None
+            status = "산일반불일치"
     item = {"addr": addr, "status": status, "pnu": pnu, "x": x, "y": y, "refined": refined}
-    if need_parcel and status == "OK" and x:
+    if need_parcel and is_ok(status) and x:
         item["geom"], item["props"] = get_parcel(x, y, api_key, domain)
     return item
 
@@ -510,20 +565,31 @@ def cell_str(grid, r, c):
     return row[c - 1] if 1 <= c <= len(row) else ""
 
 
+def _jibun_text(jibun_raw, bon_raw, bu_raw, kind, san_flag):
+    """지번 문자열을 만든다. san_flag(대장구분 열) 가 참이면 '산 ' 을 붙인다.
+    산 필지를 일반 지번으로 조회하면 '주소인식실패' 또는 엉뚱한 필지에 매칭되므로 반드시 필요."""
+    if kind == "cell":
+        core = str(jibun_raw or "").strip()
+        already = core.replace(" ", "").startswith("산")
+        if not core:
+            return ""
+        return core if already else (f"산 {core}" if san_flag else core)
+    is_san = str(bon_raw or "").replace(" ", "").startswith("산") or san_flag
+    bon = "".join(ch for ch in str(bon_raw or "") if ch.isdigit())
+    bu = "".join(ch for ch in str(bu_raw or "") if ch.isdigit())
+    core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
+    return (f"산 {core}" if (is_san and core) else core)
+
+
 def build_address(grid, r, sel):
     if sel["kind"] == "full":
         return cell_str(grid, r, sel.get("addr_col"))
     prefix = " ".join(p for p in (cell_str(grid, r, c) for c in sel["admin_cols"]) if p).strip()
-    if sel["jibun_kind"] == "cell":
-        j = cell_str(grid, r, sel.get("jibun_col"))
-    else:
-        bon_raw = cell_str(grid, r, sel.get("bon_col"))
-        bu_raw = cell_str(grid, r, sel.get("bu_col"))
-        is_san = bon_raw.replace(" ", "").startswith("산")
-        bon = "".join(ch for ch in bon_raw if ch.isdigit())
-        bu = "".join(ch for ch in bu_raw if ch.isdigit())
-        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
-        j = (f"산 {core}" if is_san else core)
+    san_flag = is_san_value(cell_str(grid, r, sel.get("san_col"))) if sel.get("san_col") else False
+    j = _jibun_text(cell_str(grid, r, sel.get("jibun_col")),
+                    cell_str(grid, r, sel.get("bon_col")),
+                    cell_str(grid, r, sel.get("bu_col")),
+                    sel["jibun_kind"], san_flag)
     return f"{prefix} {j}".strip()
 
 
@@ -540,16 +606,11 @@ def build_address_row(row, sel):
     if sel["kind"] == "full":
         return _row_cell(row, sel.get("addr_col"))
     prefix = " ".join(p for p in (_row_cell(row, c) for c in sel["admin_cols"]) if p).strip()
-    if sel["jibun_kind"] == "cell":
-        j = _row_cell(row, sel.get("jibun_col"))
-    else:
-        bon_raw = _row_cell(row, sel.get("bon_col"))
-        bu_raw = _row_cell(row, sel.get("bu_col"))
-        is_san = bon_raw.replace(" ", "").startswith("산")
-        bon = "".join(ch for ch in bon_raw if ch.isdigit())
-        bu = "".join(ch for ch in bu_raw if ch.isdigit())
-        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
-        j = (f"산 {core}" if is_san else core)
+    san_flag = is_san_value(_row_cell(row, sel.get("san_col"))) if sel.get("san_col") else False
+    j = _jibun_text(_row_cell(row, sel.get("jibun_col")),
+                    _row_cell(row, sel.get("bon_col")),
+                    _row_cell(row, sel.get("bu_col")),
+                    sel["jibun_kind"], san_flag)
     return f"{prefix} {j}".strip()
 
 
@@ -559,6 +620,28 @@ def full_addr_row(row, sel, prefix=""):
 
 
 # ---------- 자동 추정 ----------
+SAN_HEAD_KEYS = ("대장구분", "산구분", "산여부", "지적구분", "대장종류", "토지구분")
+SAN_VALUES = {"산", "일반", "임야", "토지", "임야대장", "토지대장"}
+# 앞부분 행에서 값이 비어 있어도 주소 구성 열로 인정할 제목들
+# (예: 동 지역이 먼저 나오는 토지대장은 '리' 열이 한참 아래에서야 채워진다)
+ADDR_UNIT_HEADS = {"리", "동", "읍", "면", "읍면동", "법정동", "행정동", "동리", "법정리", "리명"}
+
+
+def detect_san_col(grid, start_row):
+    """대장구분(산/일반) 열 자동 추정. 제목 → 값 순으로 본다."""
+    max_r = min(n_rows(grid), 300); max_c = min(n_cols(grid), MAX_COLS)
+    for c in range(1, max_c + 1):
+        for hr in range(1, min(start_row, max_r + 1)):
+            if any(k in cell_str(grid, hr, c) for k in SAN_HEAD_KEYS):
+                return c
+    for c in range(1, max_c + 1):   # 값 기반: 산/일반 만 나오는 열
+        vals = [cell_str(grid, r, c) for r in range(start_row, min(start_row + 30, max_r + 1))]
+        vals = [v for v in vals if v]
+        if len(vals) >= 5 and all(v in SAN_VALUES for v in vals) and any(v in ("산", "임야") for v in vals):
+            return c
+    return None
+
+
 def detect_layout(grid):
     max_r = min(n_rows(grid), 300); max_c = min(n_cols(grid), MAX_COLS)
     hits = {}
@@ -568,24 +651,41 @@ def detect_layout(grid):
             if v and any(v.startswith(s) for s in SIDO):
                 hits.setdefault(c, []).append((r, v))
     if not hits:
-        return {"start_row": 2, "mode": "split", "cols": [1]}
+        return {"start_row": 2, "mode": "split", "cols": [1], "san_col": detect_san_col(grid, 2)}
     sido_col = max(hits, key=lambda c: len(hits[c]))
     start_row = min(r for r, _ in hits[sido_col])
+    san_col = detect_san_col(grid, start_row)
     samples = [v for _, v in hits[sido_col]]
     if any((" " in v and any(ch.isdigit() for ch in v)) for v in samples):
-        return {"start_row": start_row, "mode": "single", "cols": [sido_col]}
+        return {"start_row": start_row, "mode": "single", "cols": [sido_col], "san_col": san_col}
+    header_row = start_row - 1
     jibun_re = re.compile(r"^산?\d+(-\d+)?$")
     cols = [sido_col]; c = sido_col + 1
     while c <= max_c and len(cols) < 6:
+        if c == san_col:        # 대장구분은 주소 글자가 아니라 산 표기용 → 주소 열에서 제외
+            c += 1; continue
         vals = [cell_str(grid, rr, c) for rr in range(start_row, min(start_row + 8, max_r + 1))]
         vals = [v for v in vals if v]
         if not vals:
+            # 앞부분만 비어 있는 '리' 같은 열은 제목을 보고 살린다
+            if cell_str(grid, header_row, c).strip() in ADDR_UNIT_HEADS and len(cols) < 5:
+                cols.append(c); c += 1; continue
             break
         cols.append(c)
         if sum(1 for v in vals if jibun_re.match(v.replace(" ", ""))) >= max(1, len(vals) // 2):
             break
         c += 1
-    return {"start_row": start_row, "mode": "split", "cols": cols}
+
+    bon_col = bu_col = None      # 본번·부번이 따로 있으면 '분리' 모드로 열어 준다
+    for cc in range(1, max_c + 1):
+        h = cell_str(grid, header_row, cc)
+        if bon_col is None and "본번" in h:
+            bon_col = cc
+        if bu_col is None and "부번" in h:
+            bu_col = cc
+    return {"start_row": start_row, "mode": "split",
+            "cols": [x for x in cols if x != san_col], "san_col": san_col,
+            "bon_col": bon_col, "bu_col": bu_col}
 
 
 def detect_combine(grid):
@@ -818,6 +918,19 @@ class ColumnDialog(tk.Toplevel):
 
         self.jcell_frame.grid(row=4, column=0, columnspan=3, pady=4)
         self.jbonbu_frame.grid(row=5, column=0, columnspan=3, pady=4)
+
+        # 대장구분(산) 열 — 산 필지를 일반 지번으로 조회하면 실패하거나 엉뚱한 필지에 붙는다
+        sanf = tk.Frame(self.split_frame, bg=CARD)
+        sanf.grid(row=6, column=0, columnspan=3, pady=(8, 2))
+        tk.Label(sanf, text="대장구분(산) 열:", bg=CARD, fg=ACCENT_D,
+                 font=(UI_FONT, 10, "bold")).pack(side="left")
+        self.san_cb = ttk.Combobox(sanf, values=self.opts, width=20, state="readonly")
+        self.san_cb.pack(side="left", padx=6)
+        self.san_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        tk.Label(self.split_frame,
+                 text="값이 '산'·'임야' 인 행은 지번 앞에 '산' 을 붙입니다 (없으면 (없음) 그대로 두기)",
+                 bg=CARD, fg=MUTED, font=(UI_FONT, 9)).grid(row=7, column=0, columnspan=3, pady=(0, 2))
+
         self.full_frame.grid(row=5, column=0, columnspan=4, pady=8)
         self.split_frame.grid(row=6, column=0, columnspan=4, pady=8, padx=24)
 
@@ -853,6 +966,12 @@ class ColumnDialog(tk.Toplevel):
             for i, c in enumerate(admin[:5]):
                 self.admin_cbs[i].set(self.idx_to_opt.get(c, "(없음)"))
             self.jibun_cb.set(self.idx_to_opt.get(jibun, "(없음)"))
+            bon_c, bu_c = detected.get("bon_col"), detected.get("bu_col")
+            if bon_c and bu_c:      # 본번·부번이 따로 있는 파일 → 분리 모드로 미리 맞춰 둠
+                self.jibun_kind.set("bonbu")
+                self.bon_cb.set(self.idx_to_opt.get(bon_c, "(없음)"))
+                self.bu_cb.set(self.idx_to_opt.get(bu_c, "(없음)"))
+        self.san_cb.set(self.idx_to_opt.get(detected.get("san_col"), "(없음)"))
         self._ready = True
         self.on_mode(); self.on_jibun()
 
@@ -882,8 +1001,11 @@ class ColumnDialog(tk.Toplevel):
         if self.mode_var.get() == "full":
             return {"start_row": start, "kind": "full", "addr_col": self.idx(self.full_cb),
                     "prefix": prefix}
-        sel = {"start_row": start, "kind": "split", "prefix": prefix,
-               "admin_cols": [self.idx(cb) for cb in self.admin_cbs if self.idx(cb)],
+        san_col = self.idx(self.san_cb)
+        sel = {"start_row": start, "kind": "split", "prefix": prefix, "san_col": san_col,
+               # 대장구분은 주소 글자가 아니므로 주소 구성 열에서 빼 준다(둘 다 고른 경우 방어)
+               "admin_cols": [self.idx(cb) for cb in self.admin_cbs
+                              if self.idx(cb) and self.idx(cb) != san_col],
                "jibun_kind": self.jibun_kind.get()}
         if sel["jibun_kind"] == "cell":
             sel["jibun_col"] = self.idx(self.jibun_cb)
@@ -1614,6 +1736,17 @@ class App:
             note = f" · 고유주소 {uniq:,}건만 조회" if uniq < total else ""
             eng_txt = "카카오" if engine == "kakao" else "VWorld"
             self.write(f"변환 시작: {total:,}건 · {eng_txt} · 동시 {workers}개 · 건너뜀 {skip:,}{note}")
+            fallback = usable_vworld_key(api_key)
+            _vw_fallback_off.clear()
+            if engine == "kakao":
+                if fallback:
+                    self.write("※ 카카오가 못 찾은 주소는 VWorld로 한 번 더 조회합니다(상태열 'OK(VWorld)').")
+                else:
+                    self.write("※ VWorld 인증키가 없어 보완 조회는 건너뜁니다(위 🔑 칸에 넣으면 실패가 줄어요).")
+            san_check = bool(sel.get("san_col"))
+            if san_check:
+                self.write("※ 대장구분 열을 반영해 산 필지는 '산 12-3' 형태로 조회하고, "
+                           "산↔일반이 뒤바뀐 결과는 버립니다(상태열 '산일반불일치').")
 
             results = {}
             done = 0; fails = 0
@@ -1621,14 +1754,15 @@ class App:
             self.set_progress(0, total)
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(work, a, api_key, crs, need_parcel, domain, engine, kakao_key): a
+                futs = {ex.submit(work, a, api_key, crs, need_parcel, domain,
+                                  engine, kakao_key, fallback, san_check): a
                         for a in addr_to_rows}
                 comp = 0
                 for fut in as_completed(futs):
                     a = futs[fut]; item = fut.result()
                     for r in addr_to_rows[a]:
                         results[r] = item
-                    if item["status"] != "OK":
+                    if not is_ok(item["status"]):
                         fails += len(addr_to_rows[a])
                     comp += 1; done += len(addr_to_rows[a])
                     if comp % 30 == 0 or done >= total:
@@ -1647,7 +1781,7 @@ class App:
 
     def save_records(self, path, tab, sel, opts, grid_full, base_width, row_addr, results, valid_rows, skip):
         start_row = sel["start_row"]
-        ok = fail = commfail = undone = 0
+        ok = fail = commfail = undone = vwfix = 0
         result_by_row = {}
         if tab == 1:
             want_jiga = opts["jiga"]
@@ -1660,9 +1794,11 @@ class App:
                     result_by_row[r] = [row_addr[r]] + [None] * (len(heads) - 2) + ["미처리"]
                     continue
                 status = item["status"]; pnu = item["pnu"]
-                st_ = "PNU불완전" if (status == "OK" and not (pnu and len(pnu) == 19)) else status
-                if status == "OK":
+                st_ = "PNU불완전" if (is_ok(status) and not (pnu and len(pnu) == 19)) else status
+                if is_ok(status):
                     ok += 1
+                    if status != "OK":
+                        vwfix += 1
                 else:
                     fail += 1
                     if str(status).startswith("통신실패"):
@@ -1686,8 +1822,10 @@ class App:
                     result_by_row[r] = [row_addr[r], None, None, None, "미처리"]
                     continue
                 status = item["status"]
-                if status == "OK":
+                if is_ok(status):
                     ok += 1
+                    if status != "OK":
+                        vwfix += 1
                 else:
                     fail += 1
                     if str(status).startswith("통신실패"):
@@ -1702,6 +1840,8 @@ class App:
         self.status_lbl.config(text=f"✅ {done_word}"); self.eta_lbl.config(text="")
         undone_txt = f" / 미처리 {undone:,}" if undone else ""
         self.write(f"\n✅ 완료 · 성공 {ok:,} / 실패 {fail:,} / 건너뜀 {skip:,}{undone_txt}")
+        if vwfix:
+            self.write(f"※ 그중 {vwfix:,}건은 카카오가 못 찾아 VWorld로 채웠어요(상태열 'OK(VWorld)').")
         if commfail:
             self.write(f"※ 통신실패 {commfail:,}건 — VWorld 연결이 조여졌을 수 있어요. "
                        f"동시 처리 수를 줄이거나(예: {max(1, self._workers()-1)}) 잠시 뒤 실패분만 다시 돌려 보세요.")
@@ -1729,6 +1869,8 @@ class App:
         total = len(valid)
         eng_txt = "카카오" if engine == "kakao" else "VWorld"
         self.write(f"변환 시작: {total:,}건 · {eng_txt} · 동시 {workers}개 · 건너뜀 {skip:,}")
+        fallback = usable_vworld_key(api_key)
+        _vw_fallback_off.clear()
         # 같은 주소는 한 번만 조회(중복 제거)
         addr_to_pos = {}
         for p, a in enumerate(valid):
@@ -1739,14 +1881,15 @@ class App:
         self.set_progress(0, total)
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(work, a, api_key, "EPSG:4326", need_pg, domain, engine, kakao_key): a
+            futs = {ex.submit(work, a, api_key, "EPSG:4326", need_pg, domain,
+                              engine, kakao_key, fallback, bool(sel.get("san_col"))): a
                     for a in addr_to_pos}
             comp = 0
             for fut in as_completed(futs):
                 a = futs[fut]; item = fut.result()
                 for p in addr_to_pos[a]:
                     results[p] = item
-                if item["status"] != "OK":
+                if not is_ok(item["status"]):
                     fails += len(addr_to_pos[a])
                 comp += 1; done += len(addr_to_pos[a])
                 if comp % 30 == 0 or done >= total:
@@ -1763,7 +1906,7 @@ class App:
                 continue
             status = item["status"]; x = item["x"]; y = item["y"]
             pnu = item["pnu"]; refined = item["refined"]; addr = item["addr"]
-            if status != "OK" or not x:
+            if not is_ok(status) or not x:
                 fail += 1; continue
             ok += 1
             bon, bu = parse_bonbu(pnu)
