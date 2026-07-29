@@ -373,6 +373,39 @@ def geocode(addr, api_key, crs="EPSG:4326", retries=GEO_RETRIES):
     return None, None, None, None, f"통신실패:{last}"
 
 
+def parcel_by_pnu(pnu, api_key, domain="localhost", retries=4):
+    """연속지적도(LP_PA_CBND_BUBUN)에 PNU 로 직접 물어본다 → (상태, 주소, x, y).
+    상태 = 'live'(지적도에 있음) · 'gone'(없음 = 합병·말소 등) · 'unknown'(조회 실패).
+
+    get_parcel 은 좌표(geomFilter)로 찾지만 이건 속성(attrFilter)으로 찾는다. 그래서
+    지오코딩이 실패해 좌표를 모르는 필지도 확인할 수 있다. 좌표는 경계 중심점으로 돌려준다.
+    VWorld API 는 항상 그쪽 최신 데이터를 보므로 내려받아 관리할 파일이 없다."""
+    for attempt in range(retries):
+        _rate_gate()
+        j, err = _vworld_json(DATA_URL, {
+            "service": "data", "request": "GetFeature", "data": "LP_PA_CBND_BUBUN",
+            "version": "2.0", "attrFilter": f"pnu:=:{pnu}", "crs": "EPSG:4326",
+            "format": "json", "size": "1", "domain": domain, "key": api_key})
+        if err is None:
+            resp = j.get("response", {})
+            st = resp.get("status")
+            if st == "NOT_FOUND":
+                return "gone", None, None, None
+            if st != "OK":
+                return "unknown", None, None, None
+            try:
+                feat = resp["result"]["featureCollection"]["features"][0]
+                addr = (feat.get("properties") or {}).get("addr")
+                ring = feat["geometry"]["coordinates"][0][0]
+                xs = [c[0] for c in ring]; ys = [c[1] for c in ring]
+                return "live", addr, sum(xs) / len(xs), sum(ys) / len(ys)
+            except (KeyError, IndexError, TypeError, ZeroDivisionError):
+                return "live", None, None, None
+        if attempt < retries - 1:
+            time.sleep(_backoff(attempt))
+    return "unknown", None, None, None
+
+
 def get_parcel(x, y, api_key, domain="localhost", retries=4):
     for attempt in range(retries):
         _rate_gate()
@@ -1906,19 +1939,54 @@ class App:
                     self.write(f"↻ 재시도로 {fixed:,}건 채웠어요."
                                if fixed else "↻ 재시도로 채워진 건 없어요(연결이 계속 조여진 상태일 수 있어요).")
 
-            self.save_records(path, tab, sel, opts, grid_full, base_width, row_addr, results, valid_rows, skip)
+            # 조회 실패 + 고유번호 있음 → 그 PNU 가 연속지적도에 실제로 있는지 확인한다.
+            # 실재(주소만 없는 도로·구거)와 말소(합병 등으로 사라진 지번)를 구분하는 유일한 방법.
+            # 대상은 실패 행뿐이라 건수가 적고(실측 0.66%), 건당 0.18초라 부담이 없다.
+            cadastre = {}
+            if sel.get("code_col") and api_key and not self._cancel.is_set():
+                todo = {}
+                for r in valid_rows:
+                    it = results.get(r)
+                    if it is None or is_ok(it["status"]):
+                        continue
+                    dj = cell_str(grid_full, r, sel.get("san_col")) if sel.get("san_col") else None
+                    lp = pnu_from_parts(cell_str(grid_full, r, sel["code_col"]),
+                                        cell_str(grid_full, r, sel.get("bon_col")),
+                                        cell_str(grid_full, r, sel.get("bu_col")), dj)
+                    if lp and len(lp) == 19:
+                        todo.setdefault(lp, None)
+                if todo:
+                    self.write(f"\n🔎 조회 실패 {len(todo):,}건이 실제로 있는 지번인지 "
+                               f"연속지적도에서 확인합니다…")
+                    self.status_lbl.config(text=f"지적도 확인 {len(todo):,}건")
+                    with ThreadPoolExecutor(max_workers=max(1, min(workers, 6))) as ex:
+                        futs = {ex.submit(parcel_by_pnu, lp, api_key, domain): lp for lp in todo}
+                        for fut in as_completed(futs):
+                            cadastre[futs[fut]] = fut.result()
+                            if self._cancel.is_set():
+                                ex.shutdown(wait=False, cancel_futures=True); break
+                    live = sum(1 for v in cadastre.values() if v[0] == "live")
+                    gone = sum(1 for v in cadastre.values() if v[0] == "gone")
+                    unk = len(cadastre) - live - gone
+                    self.write(f"🔎 실재 {live:,} / 말소·없음 {gone:,}"
+                               + (f" / 확인못함 {unk:,}" if unk else ""))
+
+            self.save_records(path, tab, sel, opts, grid_full, base_width, row_addr, results,
+                              valid_rows, skip, cadastre)
         except Exception as e:
             self.write(f"\n[오류] {e}")
             messagebox.showerror("오류", str(e))
         finally:
             self._set_running(False)
 
-    def save_records(self, path, tab, sel, opts, grid_full, base_width, row_addr, results, valid_rows, skip):
+    def save_records(self, path, tab, sel, opts, grid_full, base_width, row_addr, results,
+                     valid_rows, skip, cadastre=None):
         start_row = sel["start_row"]
         ok = fail = commfail = undone = vwfix = 0
         result_by_row = {}
         code_col = sel.get("code_col")
-        filled = mismatch = review = 0
+        cadastre = cadastre or {}
+        filled = mismatch = review = live_n = gone_n = 0
         if tab == 1:
             want_jiga = opts["jiga"]
             heads = (["입력주소", "PNU", "정제주소", "본번", "부번"]
@@ -1942,11 +2010,22 @@ class App:
                     if lp and len(lp) == 19:
                         if not (pnu and len(pnu) == 19):
                             if not is_ok(status):
-                                # 조회는 실패했다. 대장 고유번호로 PNU 를 만들어 넣되 성공으로 치지 않는다.
-                                # 그 필지가 실제로 있는지는 확인하지 못했다 — 지오코딩 실패 중
-                                # 실측 86.9%는 실재하는 땅(주소 없는 도로·구거)이고 13.1%는 말소된 지번이다.
-                                # 둘을 구분하려면 연속지적도를 봐야 하므로 여기서는 '미확인'으로 남긴다.
-                                pnu = lp; status = "대장PNU(미확인)"; filled += 1
+                                # 조회는 실패했다. 대장 고유번호로 PNU 를 만들고, 연속지적도에
+                                # 그 필지가 실제로 있는지 물어본 결과로 성공/실패를 가른다.
+                                pnu = lp
+                                cs, caddr, cx, cy = cadastre.get(lp, ("unknown", None, None, None))
+                                if cs == "live":
+                                    # 지적도에 있다 = 실재하는 땅. 주소가 없어 지오코더가 못 찾았을 뿐.
+                                    status = "OK(지적도)"; live_n += 1
+                                    item = dict(item)
+                                    item["refined"] = item.get("refined") or caddr
+                                    if cx is not None:
+                                        item["x"], item["y"] = cx, cy
+                                elif cs == "gone":
+                                    # 지적도에 없다 = 합병·말소 등으로 사라진 지번. 진짜 실패.
+                                    status = "말소·없는지번"; gone_n += 1
+                                else:
+                                    status = "대장PNU(미확인)"; filled += 1
                         elif pnu != lp:
                             # 지오코더가 다른 필지를 물어왔다 → 대장 값을 쓰고, 그 필지에서 온
                             # 정제주소·도로명주소·건물명은 남의 것이므로 버린다. 확인이 필요한 행이다.
@@ -1960,7 +2039,7 @@ class App:
                 elif status in ("대장PNU(미확인)", "대장≠조회"):
                     review += 1     # PNU는 넣었지만 조회로 확인 못 함 → 성공도 실패도 아니다
                 else:
-                    fail += 1
+                    fail += 1       # '말소·없는지번' 도 여기 — 지적도에 없으니 진짜 실패다
                     if str(status).startswith("통신실패"):
                         commfail += 1
                 bon, bu = parse_bonbu(pnu)
@@ -2004,10 +2083,17 @@ class App:
         self.write(f"\n✅ 완료 · 성공 {ok:,}{review_txt} / 실패 {fail:,} / 건너뜀 {skip:,}{undone_txt}")
         if vwfix:
             self.write(f"※ 그중 {vwfix:,}건은 카카오가 못 찾아 VWorld로 채웠어요(상태열 'OK(VWorld)').")
+        if live_n:
+            self.write(f"※ 그중 {live_n:,}건은 주소가 없어 조회는 실패했지만 연속지적도에 실재하는 "
+                       f"필지였어요(상태열 'OK(지적도)'). 도로·구거처럼 주소가 안 붙은 땅입니다.")
+        if gone_n:
+            self.write(f"⚠ {gone_n:,}건은 연속지적도에 없는 지번이에요(상태열 '말소·없는지번'). "
+                       f"합병·말소 등으로 사라졌거나, 대장 자료가 지적도보다 옛것일 수 있어요. "
+                       f"PNU는 대장 값으로 넣어 뒀습니다.")
         if filled:
             self.write(f"⚠ 조회 실패 {filled:,}건 — 대장 고유번호로 PNU만 넣었어요(상태열 '대장PNU(미확인)'). "
-                       f"성공으로 세지 않습니다: 그 지번이 실제로 있는지는 확인하지 못했어요. "
-                       f"주소가 없는 도로·구거일 수도 있고, 합병·말소된 지번일 수도 있습니다.")
+                       f"지적도 확인까지 실패해서 실재 여부를 모릅니다"
+                       f"{' (VWorld 인증키를 넣으면 확인할 수 있어요)' if not self.current_key() else ''}.")
         if mismatch:
             self.write(f"⚠ 지오코더가 대장과 다른 필지를 물어온 행 {mismatch:,}건 — "
                        f"대장 값을 썼어요(상태열 '대장≠조회'). 반드시 확인해 보세요.")
