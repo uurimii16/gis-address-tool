@@ -1028,8 +1028,9 @@ class ColumnDialog(tk.Toplevel):
         self.code_cb.pack(side="left", padx=6)
         self.code_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
         tk.Label(self.split_frame,
-                 text="선택 · 토지대장의 '고유번호' 열이 있으면 골라 두세요. 조회에 실패해도 PNU를 채우고,"
-                      " 지오코더가 엉뚱한 필지를 물어오면 대조해서 걸러 냅니다.",
+                 text="선택 · 토지대장의 '고유번호' 열이 있으면 골라 두세요. 지오코더가 엉뚱한 필지를"
+                      " 물어오면 대조해서 걸러 냅니다. 조회에 실패한 행은 PNU만 넣고 '확인필요'로"
+                      " 표시합니다(성공으로 세지 않아요 — 그 지번이 실제로 있는지는 모르니까요).",
                  bg=CARD, fg=MUTED, font=(UI_FONT, 9), wraplength=520,
                  justify="left").grid(row=9, column=0, columnspan=3, pady=(0, 2))
 
@@ -1917,7 +1918,7 @@ class App:
         ok = fail = commfail = undone = vwfix = 0
         result_by_row = {}
         code_col = sel.get("code_col")
-        filled = mismatch = 0
+        filled = mismatch = review = 0
         if tab == 1:
             want_jiga = opts["jiga"]
             heads = (["입력주소", "PNU", "정제주소", "본번", "부번"]
@@ -1941,17 +1942,23 @@ class App:
                     if lp and len(lp) == 19:
                         if not (pnu and len(pnu) == 19):
                             if not is_ok(status):
-                                pnu = lp; status = "OK(대장)"; filled += 1
+                                # 조회는 실패했다. 대장 고유번호로 PNU 를 만들어 넣되 성공으로 치지 않는다.
+                                # 그 필지가 실제로 있는지는 확인하지 못했다 — 지오코딩 실패 중
+                                # 실측 86.9%는 실재하는 땅(주소 없는 도로·구거)이고 13.1%는 말소된 지번이다.
+                                # 둘을 구분하려면 연속지적도를 봐야 하므로 여기서는 '미확인'으로 남긴다.
+                                pnu = lp; status = "대장PNU(미확인)"; filled += 1
                         elif pnu != lp:
                             # 지오코더가 다른 필지를 물어왔다 → 대장 값을 쓰고, 그 필지에서 온
-                            # 정제주소·도로명주소·건물명은 남의 것이므로 버린다.
-                            pnu = lp; status = "OK(대장≠조회)"; mismatch += 1
+                            # 정제주소·도로명주소·건물명은 남의 것이므로 버린다. 확인이 필요한 행이다.
+                            pnu = lp; status = "대장≠조회"; mismatch += 1
                             item = dict(item); item["refined"] = item["road"] = item["bld"] = None
                 st_ = "PNU불완전" if (is_ok(status) and not (pnu and len(pnu) == 19)) else status
                 if is_ok(status):
                     ok += 1
-                    if status not in ("OK", "OK(대장)"):
+                    if status != "OK":
                         vwfix += 1
+                elif status in ("대장PNU(미확인)", "대장≠조회"):
+                    review += 1     # PNU는 넣었지만 조회로 확인 못 함 → 성공도 실패도 아니다
                 else:
                     fail += 1
                     if str(status).startswith("통신실패"):
@@ -1993,14 +2000,17 @@ class App:
         done_word = "취소 — 완료분 저장" if undone else "저장 완료"
         self.status_lbl.config(text=f"✅ {done_word}"); self.eta_lbl.config(text="")
         undone_txt = f" / 미처리 {undone:,}" if undone else ""
-        self.write(f"\n✅ 완료 · 성공 {ok:,} / 실패 {fail:,} / 건너뜀 {skip:,}{undone_txt}")
+        review_txt = f" / 확인필요 {review:,}" if review else ""
+        self.write(f"\n✅ 완료 · 성공 {ok:,}{review_txt} / 실패 {fail:,} / 건너뜀 {skip:,}{undone_txt}")
         if vwfix:
             self.write(f"※ 그중 {vwfix:,}건은 카카오가 못 찾아 VWorld로 채웠어요(상태열 'OK(VWorld)').")
         if filled:
-            self.write(f"※ 조회 실패했지만 고유번호로 PNU를 채운 행 {filled:,}건(상태열 'OK(대장)').")
+            self.write(f"⚠ 조회 실패 {filled:,}건 — 대장 고유번호로 PNU만 넣었어요(상태열 '대장PNU(미확인)'). "
+                       f"성공으로 세지 않습니다: 그 지번이 실제로 있는지는 확인하지 못했어요. "
+                       f"주소가 없는 도로·구거일 수도 있고, 합병·말소된 지번일 수도 있습니다.")
         if mismatch:
             self.write(f"⚠ 지오코더가 대장과 다른 필지를 물어온 행 {mismatch:,}건 — "
-                       f"대장 값을 썼어요(상태열 'OK(대장≠조회)'). 한 번 확인해 보세요.")
+                       f"대장 값을 썼어요(상태열 '대장≠조회'). 반드시 확인해 보세요.")
         # 도로명주소·건물명 채움률 — 열이 대부분 비어 보이는 이유를 미리 알려 준다
         if tab in (1, 2):
             got = [results.get(r) for r in valid_rows]
@@ -2019,11 +2029,12 @@ class App:
         self._last_out = out_path
         extra = ""
         if filled:
-            extra += f"\n· 고유번호로 채운 행 {filled:,}건"
+            extra += (f"\n\n확인 필요 {filled:,}건 — 조회에 실패해 대장 고유번호로 PNU만 넣었습니다."
+                      f"\n(그 지번이 실제로 있는지는 확인하지 못했습니다)")
         if mismatch:
-            extra += f"\n· 대장과 다른 필지를 물어와 대장 값을 쓴 행 {mismatch:,}건"
+            extra += f"\n\n확인 필요 {mismatch:,}건 — 지오코더가 대장과 다른 필지를 물어왔습니다."
         messagebox.showinfo("완료",
-            f"성공 {ok:,}건 / 실패 {fail:,}건 / 건너뜀 {skip:,}{undone_txt}{extra}"
+            f"성공 {ok:,}건{review_txt} / 실패 {fail:,}건 / 건너뜀 {skip:,}{undone_txt}{extra}"
             f"\n\n저장되었습니다:\n{out_path}")
 
     def run_layers(self, path, ext, sheet, enc, raw, sel, opts, api_key, domain, workers):
