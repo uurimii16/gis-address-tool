@@ -18,7 +18,8 @@ GIS 주소 변환기 (데스크톱) · v9  ── 대용량 안정 병렬 + 원�
  · 전 요청 공통 속도 상한(과도한 동시 접속 방지).
 읽기/출력:
  · 미리보기·열선택은 앞 HEAD_ROWS 행만(큰 파일도 즉시). 변환은 read_only 스트리밍.
- · 출력 = 원본 열 전체 + 결과 열(입력주소·PNU·정제주소·본번·부번·상태[+공시지가]). PNU는 텍스트라 지수표기(E+) 없음.
+ · 출력 = 원본 열 전체 + 결과 열(입력주소·PNU·정제주소·본번·부번[+공시지가]·도로명주소·건물명·상태). PNU는 텍스트라 지수표기(E+) 없음.
+ · 도로명주소·건물명은 카카오 응답에 딸려 오므로 공짜(추가 호출 0). VWorld 엔진·코드조합 모드에선 빈칸.
 데스크톱은 로컬 실행이라 연결 끊김·타임아웃이 없어 대용량(수만 행) 작업에 적합. 설정은 같은 폴더 config.txt.
 """
 import os
@@ -356,10 +357,16 @@ def validate_kakao(kakao_key):
 
 
 def geocode_kakao(addr, kakao_key, retries=3):
-    """카카오 주소검색 → (pnu, x, y, refined, status). VWorld geocode 와 같은 형식.
-    카카오 응답의 b_code(법정동)+mountain_yn+본번+부번으로 19자리 PNU를 만든다. 좌표는 WGS84."""
+    """카카오 주소검색 → (pnu, x, y, refined, status, road, bld). 앞 5개는 VWorld geocode 와 같은 형식.
+    카카오 응답의 b_code(법정동)+mountain_yn+본번+부번으로 19자리 PNU를 만든다. 좌표는 WGS84.
+    road/bld = 같은 응답의 road_address(도로명주소·건물명). 추가 호출이 없어 공짜지만,
+    도로명주소는 건물이 있어야 붙으므로 논밭·도로·구거는 빈칸이다(토지대장 실측 도로명 18%·건물명 1%)."""
     headers = {"Authorization": f"KakaoAK {kakao_key}"}
     last = "실패"
+
+    def bad(status):
+        return None, None, None, None, status, "", ""
+
     for attempt in range(retries):
         _rate_gate()
         try:
@@ -369,23 +376,23 @@ def geocode_kakao(addr, kakao_key, retries=3):
             last = "연결실패:" + type(e).__name__
             if attempt < retries - 1:
                 time.sleep(_backoff(attempt)); continue
-            return None, None, None, None, f"통신실패:{last}"
+            return bad(f"통신실패:{last}")
         if r.status_code in (401, 403):
-            return None, None, None, None, "인증키오류"
+            return bad("인증키오류")
         if r.status_code != 200:
             last = f"HTTP{r.status_code}"
             if attempt < retries - 1:
                 time.sleep(_backoff(attempt)); continue
-            return None, None, None, None, f"통신실패:{last}"
+            return bad(f"통신실패:{last}")
         try:
             docs = (r.json().get("documents") or [])
         except ValueError:
             last = "비정상응답"
             if attempt < retries - 1:
                 time.sleep(_backoff(attempt)); continue
-            return None, None, None, None, f"통신실패:{last}"
+            return bad(f"통신실패:{last}")
         if not docs:
-            return None, None, None, None, "주소인식실패"
+            return bad("주소인식실패")
         d = docs[0]
         a = d.get("address") or {}
         refined = d.get("address_name") or a.get("address_name", "")
@@ -397,8 +404,12 @@ def geocode_kakao(addr, kakao_key, retries=3):
             mn = "".join(c for c in str(a.get("main_address_no", "")) if c.isdigit()).zfill(4)
             sb = "".join(c for c in str(a.get("sub_address_no", "")) if c.isdigit()).zfill(4)
             pnu = b + flag + mn + sb
-        return pnu, x, y, refined, "OK"
-    return None, None, None, None, f"통신실패:{last}"
+        # 도로명주소·건물명은 같은 응답에 딸려 온다(추가 호출 없음). 없는 필지는 road_address=null.
+        ra = d.get("road_address") or {}
+        road = (ra.get("address_name") or "").strip()
+        bld = (ra.get("building_name") or "").strip()
+        return pnu, x, y, refined, "OK", road, bld
+    return bad(f"통신실패:{last}")
 
 
 _SAN_RE = re.compile(r"(^|\s)산\s*\d")
@@ -415,13 +426,15 @@ def work(addr, api_key, crs, need_parcel, domain, engine="vworld", kakao_key="",
     engine='kakao'면 카카오로 PNU·좌표를 뽑고(빠름), 필지/공시지가는 VWorld(get_parcel)만 지원.
     fallback=True면 카카오가 못 찾은 주소만 VWorld로 한 번 더 조회한다.
     (카카오는 도로명주소 DB 기반이라 도로·구거 같은 미등록 지번이 통째로 빠진다 → VWorld가 일부 보완)"""
+    road = bld = ""
     if engine == "kakao":
-        pnu, x, y, refined, status = geocode_kakao(addr, kakao_key)
+        pnu, x, y, refined, status, road, bld = geocode_kakao(addr, kakao_key)
         if (fallback and not is_ok(status) and status != "인증키오류"
                 and api_key and not _vw_fallback_off.is_set()):
             p2, x2, y2, r2, st2 = geocode(addr, api_key, crs)
             if is_ok(st2):
                 pnu, x, y, refined, status = p2, x2, y2, r2, "OK(VWorld)"
+                road = bld = ""   # VWorld 지오코더는 도로명주소·건물명을 주지 않는다
             elif st2 == "인증키오류":
                 _vw_fallback_off.set()   # VWorld 키가 없거나 틀림 → 헛된 재조회 중단
     else:
@@ -432,7 +445,9 @@ def work(addr, api_key, crs, need_parcel, domain, engine="vworld", kakao_key="",
         if pnu[10] != ("2" if addr_is_san(addr) else "1"):
             pnu = x = y = refined = None
             status = "산일반불일치"
-    item = {"addr": addr, "status": status, "pnu": pnu, "x": x, "y": y, "refined": refined}
+            road = bld = ""
+    item = {"addr": addr, "status": status, "pnu": pnu, "x": x, "y": y, "refined": refined,
+            "road": road, "bld": bld}
     if need_parcel and is_ok(status) and x:
         item["geom"], item["props"] = get_parcel(x, y, api_key, domain)
     return item
@@ -1246,7 +1261,9 @@ class App:
         # 변환 엔진 선택
         engf = tk.Frame(card, bg=CARD); engf.pack(fill="x", padx=22)
         tk.Label(engf, text="변환 엔진:", bg=CARD, fg=INK, font=(UI_FONT, 11, "bold")).pack(side="left")
-        self.engine_var = tk.StringVar(value="vworld")
+        # 기본은 카카오: VWorld보다 2배 이상 빠르고(33건/s vs 14건/s) 일일 한도도 넉넉하다
+        # (카카오 10만/일 vs VWorld 지오코더 4만/일). 필지·공시지가가 필요할 때만 VWorld로 바꾼다.
+        self.engine_var = tk.StringVar(value="kakao")
         tk.Radiobutton(engf, text="카카오 (빠름 · PNU·좌표)", value="kakao", variable=self.engine_var,
                        command=self._on_engine, bg=CARD, fg=INK, selectcolor=SOFT,
                        activebackground=CARD, font=(UI_FONT, 10), cursor="hand2").pack(side="left", padx=(8, 4))
@@ -1378,10 +1395,10 @@ class App:
                 b.config(bg=TAB_OFF_BG, fg=MUTED)
         self.opt_pnu.pack_forget(); self.opt_geo.pack_forget(); self.opt_layer.pack_forget()
         if n == 1:
-            self.desc.config(text="주소를 19자리 PNU로 변환합니다. 원본 열은 그대로 두고 결과 열을 오른쪽에 덧붙입니다.\n결과: 입력주소 · PNU · 정제주소 · 본번 · 부번 (선택 시 공시지가·기준연월)")
+            self.desc.config(text="주소를 19자리 PNU로 변환합니다. 원본 열은 그대로 두고 결과 열을 오른쪽에 덧붙입니다.\n결과: 입력주소 · PNU · 정제주소 · 본번 · 부번 (선택 시 공시지가·기준연월) · 도로명주소 · 건물명")
             self.opt_pnu.pack(anchor="w")
         elif n == 2:
-            self.desc.config(text="주소를 지도 좌표로 변환합니다. 원본 열은 그대로 두고 결과 열을 오른쪽에 덧붙입니다.\n결과: 입력주소 · 선택 좌표계의 X · Y · 정제주소")
+            self.desc.config(text="주소를 지도 좌표로 변환합니다. 원본 열은 그대로 두고 결과 열을 오른쪽에 덧붙입니다.\n결과: 입력주소 · 선택 좌표계의 X · Y · 정제주소 · 도로명주소 · 건물명")
             self.opt_geo.pack(anchor="w")
         else:
             self.desc.config(text="주소를 QGIS에서 바로 열리는 지도 레이어(GeoJSON)로 만듭니다.\nQGIS 창에 파일을 끌어다 놓으면 점/필지로 표시됩니다.")
@@ -1786,7 +1803,8 @@ class App:
         if tab == 1:
             want_jiga = opts["jiga"]
             heads = (["입력주소", "PNU", "정제주소", "본번", "부번"]
-                     + (["공시지가(원/㎡)", "기준연월"] if want_jiga else []) + ["상태"])
+                     + (["공시지가(원/㎡)", "기준연월"] if want_jiga else [])
+                     + ["도로명주소", "건물명", "상태"])
             for r in valid_rows:
                 item = results.get(r)
                 if item is None:   # 취소로 아직 처리 안 된 행
@@ -1810,16 +1828,16 @@ class App:
                     jg = props.get("jiga")
                     vals += [int(jg) if jg and str(jg).isdigit() else None,
                              (f"{props.get('gosi_year','')}.{props.get('gosi_month','')}".strip(".") if props else None)]
-                vals += [st_]
+                vals += [item.get("road") or None, item.get("bld") or None, st_]
                 result_by_row[r] = vals
         else:
             xlab, ylab = CRS_OPTIONS[opts["crs_label"]][1], CRS_OPTIONS[opts["crs_label"]][2]
-            heads = ["입력주소", xlab, ylab, "정제주소", "상태"]
+            heads = ["입력주소", xlab, ylab, "정제주소", "도로명주소", "건물명", "상태"]
             for r in valid_rows:
                 item = results.get(r)
                 if item is None:   # 취소로 아직 처리 안 된 행
                     undone += 1
-                    result_by_row[r] = [row_addr[r], None, None, None, "미처리"]
+                    result_by_row[r] = [row_addr[r]] + [None] * (len(heads) - 2) + ["미처리"]
                     continue
                 status = item["status"]
                 if is_ok(status):
@@ -1830,7 +1848,8 @@ class App:
                     fail += 1
                     if str(status).startswith("통신실패"):
                         commfail += 1
-                result_by_row[r] = [row_addr[r], item.get("x"), item.get("y"), item.get("refined"), status]
+                result_by_row[r] = [row_addr[r], item.get("x"), item.get("y"), item.get("refined"),
+                                    item.get("road") or None, item.get("bld") or None, status]
 
         out_path = os.path.splitext(path)[0] + "_결과.xlsx"
         self.write("결과 저장 중…")
