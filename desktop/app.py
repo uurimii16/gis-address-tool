@@ -750,9 +750,29 @@ def detect_layout(grid):
             bon_col = cc
         if bu_col is None and "부번" in h:
             bu_col = cc
+    code_col = detect_code_col(grid, header_row, start_row)
     return {"start_row": start_row, "mode": "split",
-            "cols": [x for x in cols if x != san_col], "san_col": san_col,
-            "bon_col": bon_col, "bu_col": bu_col}
+            "cols": [x for x in cols if x not in (san_col, code_col)], "san_col": san_col,
+            "bon_col": bon_col, "bu_col": bu_col, "code_col": code_col}
+
+
+CODE_HEAD_KEYS = ("고유번호", "법정동코드", "PNU", "지번코드", "필지고유")
+
+
+def detect_code_col(grid, header_row, start_row):
+    """고유번호(19자리)/법정동코드(10자리) 열 자동 추정. 제목 → 값 순으로 본다.
+    '토지대장'처럼 모호한 제목은 쓰지 않는다(주소 열과 헷갈릴 수 있어 값으로 확인한다)."""
+    max_r = min(n_rows(grid), 300); max_c = min(n_cols(grid), MAX_COLS)
+    for c in range(1, max_c + 1):
+        for hr in range(1, min(max(header_row, 1) + 1, max_r + 1)):
+            if any(k in cell_str(grid, hr, c) for k in CODE_HEAD_KEYS):
+                return c
+    for c in range(1, max_c + 1):   # 값 기반: 10자리 이상 숫자만 들어 있는 열
+        vals = [cell_str(grid, r, c) for r in range(start_row, min(start_row + 20, max_r + 1))]
+        vals = [v for v in vals if v]
+        if len(vals) >= 5 and all(v.isdigit() and len(v) in (10, 19) for v in vals):
+            return c
+    return None
 
 
 def detect_combine(grid):
@@ -998,6 +1018,21 @@ class ColumnDialog(tk.Toplevel):
                  text="값이 '산'·'임야' 인 행은 지번 앞에 '산' 을 붙입니다 (없으면 (없음) 그대로 두기)",
                  bg=CARD, fg=MUTED, font=(UI_FONT, 9)).grid(row=7, column=0, columnspan=3, pady=(0, 2))
 
+        # 고유번호(19자리) / 법정동코드(10자리) 열 — 있으면 PNU를 통신 없이 확정할 수 있다.
+        # 지오코딩이 실패해도 PNU를 채우고, 지오코더가 다른 필지를 물어오면 대조해서 잡아낸다.
+        codef = tk.Frame(self.split_frame, bg=CARD)
+        codef.grid(row=8, column=0, columnspan=3, pady=(8, 2))
+        tk.Label(codef, text="고유번호/법정동코드 열:", bg=CARD, fg=ACCENT_D,
+                 font=(UI_FONT, 10, "bold")).pack(side="left")
+        self.code_cb = ttk.Combobox(codef, values=self.opts, width=20, state="readonly")
+        self.code_cb.pack(side="left", padx=6)
+        self.code_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        tk.Label(self.split_frame,
+                 text="선택 · 토지대장의 '고유번호' 열이 있으면 골라 두세요. 조회에 실패해도 PNU를 채우고,"
+                      " 지오코더가 엉뚱한 필지를 물어오면 대조해서 걸러 냅니다.",
+                 bg=CARD, fg=MUTED, font=(UI_FONT, 9), wraplength=520,
+                 justify="left").grid(row=9, column=0, columnspan=3, pady=(0, 2))
+
         self.full_frame.grid(row=5, column=0, columnspan=4, pady=8)
         self.split_frame.grid(row=6, column=0, columnspan=4, pady=8, padx=24)
 
@@ -1039,6 +1074,7 @@ class ColumnDialog(tk.Toplevel):
                 self.bon_cb.set(self.idx_to_opt.get(bon_c, "(없음)"))
                 self.bu_cb.set(self.idx_to_opt.get(bu_c, "(없음)"))
         self.san_cb.set(self.idx_to_opt.get(detected.get("san_col"), "(없음)"))
+        self.code_cb.set(self.idx_to_opt.get(detected.get("code_col"), "(없음)"))
         self._ready = True
         self.on_mode(); self.on_jibun()
 
@@ -1069,10 +1105,12 @@ class ColumnDialog(tk.Toplevel):
             return {"start_row": start, "kind": "full", "addr_col": self.idx(self.full_cb),
                     "prefix": prefix}
         san_col = self.idx(self.san_cb)
+        code_col = self.idx(self.code_cb)
         sel = {"start_row": start, "kind": "split", "prefix": prefix, "san_col": san_col,
-               # 대장구분은 주소 글자가 아니므로 주소 구성 열에서 빼 준다(둘 다 고른 경우 방어)
+               "code_col": code_col,
+               # 대장구분·고유번호는 주소 글자가 아니므로 주소 구성 열에서 빼 준다(둘 다 고른 경우 방어)
                "admin_cols": [self.idx(cb) for cb in self.admin_cbs
-                              if self.idx(cb) and self.idx(cb) != san_col],
+                              if self.idx(cb) and self.idx(cb) not in (san_col, code_col)],
                "jibun_kind": self.jibun_kind.get()}
         if sel["jibun_kind"] == "cell":
             sel["jibun_col"] = self.idx(self.jibun_cb)
@@ -1841,6 +1879,32 @@ class App:
             if self._cancel.is_set():
                 self.write("⏹ 취소됨 — 완료분까지 저장합니다.")
 
+            # 통신실패만 자동으로 한 번 더 — 순간적인 조임이 대부분이라 시간이 조금 지나면 풀린다.
+            # 주소인식실패는 다시 물어도 답이 같으므로 제외한다.
+            if not self._cancel.is_set():
+                retry = [a for a, rows in addr_to_rows.items()
+                         if str((results.get(rows[0]) or {}).get("status", "")).startswith("통신실패")]
+                if retry:
+                    rw = max(1, min(workers, 4))   # 조여진 상태이므로 동시 수를 낮춘다
+                    self.write(f"\n↻ 통신실패 {len(retry):,}건만 다시 시도합니다 (동시 {rw}개)…")
+                    self.status_lbl.config(text=f"통신실패 재시도 {len(retry):,}건")
+                    time.sleep(2.0)
+                    fixed = 0
+                    with ThreadPoolExecutor(max_workers=rw) as ex:
+                        futs = {ex.submit(work, a, api_key, crs, need_parcel, domain,
+                                          engine, kakao_key, fallback, san_check): a
+                                for a in retry}
+                        for fut in as_completed(futs):
+                            a = futs[fut]; item = fut.result()
+                            if is_ok(item["status"]):
+                                fixed += len(addr_to_rows[a])
+                            for r in addr_to_rows[a]:
+                                results[r] = item
+                            if self._cancel.is_set():
+                                ex.shutdown(wait=False, cancel_futures=True); break
+                    self.write(f"↻ 재시도로 {fixed:,}건 채웠어요."
+                               if fixed else "↻ 재시도로 채워진 건 없어요(연결이 계속 조여진 상태일 수 있어요).")
+
             self.save_records(path, tab, sel, opts, grid_full, base_width, row_addr, results, valid_rows, skip)
         except Exception as e:
             self.write(f"\n[오류] {e}")
@@ -1852,6 +1916,8 @@ class App:
         start_row = sel["start_row"]
         ok = fail = commfail = undone = vwfix = 0
         result_by_row = {}
+        code_col = sel.get("code_col")
+        filled = mismatch = 0
         if tab == 1:
             want_jiga = opts["jiga"]
             heads = (["입력주소", "PNU", "정제주소", "본번", "부번"]
@@ -1864,10 +1930,27 @@ class App:
                     result_by_row[r] = [row_addr[r]] + [None] * (len(heads) - 2) + ["미처리"]
                     continue
                 status = item["status"]; pnu = item["pnu"]
+                # 고유번호 열이 있으면 그 값이 정본이다(토지대장 원본). 지오코딩 결과와 대조한다.
+                #  · 조회 실패 → 대장 값으로 PNU를 채운다(통신 없이 확정).
+                #  · 둘 다 있는데 다르다 → 지오코더가 다른 필지를 물어온 것이므로 대장 값을 쓰고 표시한다.
+                if code_col:
+                    dj = cell_str(grid_full, r, sel.get("san_col")) if sel.get("san_col") else None
+                    lp = pnu_from_parts(cell_str(grid_full, r, code_col),
+                                        cell_str(grid_full, r, sel.get("bon_col")),
+                                        cell_str(grid_full, r, sel.get("bu_col")), dj)
+                    if lp and len(lp) == 19:
+                        if not (pnu and len(pnu) == 19):
+                            if not is_ok(status):
+                                pnu = lp; status = "OK(대장)"; filled += 1
+                        elif pnu != lp:
+                            # 지오코더가 다른 필지를 물어왔다 → 대장 값을 쓰고, 그 필지에서 온
+                            # 정제주소·도로명주소·건물명은 남의 것이므로 버린다.
+                            pnu = lp; status = "OK(대장≠조회)"; mismatch += 1
+                            item = dict(item); item["refined"] = item["road"] = item["bld"] = None
                 st_ = "PNU불완전" if (is_ok(status) and not (pnu and len(pnu) == 19)) else status
                 if is_ok(status):
                     ok += 1
-                    if status != "OK":
+                    if status not in ("OK", "OK(대장)"):
                         vwfix += 1
                 else:
                     fail += 1
@@ -1913,12 +1996,35 @@ class App:
         self.write(f"\n✅ 완료 · 성공 {ok:,} / 실패 {fail:,} / 건너뜀 {skip:,}{undone_txt}")
         if vwfix:
             self.write(f"※ 그중 {vwfix:,}건은 카카오가 못 찾아 VWorld로 채웠어요(상태열 'OK(VWorld)').")
+        if filled:
+            self.write(f"※ 조회 실패했지만 고유번호로 PNU를 채운 행 {filled:,}건(상태열 'OK(대장)').")
+        if mismatch:
+            self.write(f"⚠ 지오코더가 대장과 다른 필지를 물어온 행 {mismatch:,}건 — "
+                       f"대장 값을 썼어요(상태열 'OK(대장≠조회)'). 한 번 확인해 보세요.")
+        # 도로명주소·건물명 채움률 — 열이 대부분 비어 보이는 이유를 미리 알려 준다
+        if tab in (1, 2):
+            got = [results.get(r) for r in valid_rows]
+            got = [g for g in got if g]
+            if got:
+                nr = sum(1 for g in got if g.get("road"))
+                nb = sum(1 for g in got if g.get("bld"))
+                if nr or self._engine() == "kakao":
+                    self.write(f"※ 도로명주소 {nr:,}건({nr/len(got)*100:.1f}%) · "
+                               f"건물명 {nb:,}건({nb/len(got)*100:.1f}%) 채워졌어요. "
+                               f"도로명주소는 건물이 있는 땅에만 붙어서 논밭·도로·구거는 빈칸입니다.")
         if commfail:
-            self.write(f"※ 통신실패 {commfail:,}건 — VWorld 연결이 조여졌을 수 있어요. "
-                       f"동시 처리 수를 줄이거나(예: {max(1, self._workers()-1)}) 잠시 뒤 실패분만 다시 돌려 보세요.")
+            self.write(f"※ 통신실패 {commfail:,}건 — 연결이 조여졌을 수 있어요. "
+                       f"동시 처리 수를 줄이거나(예: {max(1, self._workers()-1)}) 잠시 뒤 다시 시도해 보세요.")
         self.write(f"저장: {out_path}")
+        self._last_out = out_path
+        extra = ""
+        if filled:
+            extra += f"\n· 고유번호로 채운 행 {filled:,}건"
+        if mismatch:
+            extra += f"\n· 대장과 다른 필지를 물어와 대장 값을 쓴 행 {mismatch:,}건"
         messagebox.showinfo("완료",
-            f"성공 {ok:,}건 / 실패 {fail:,}건 / 건너뜀 {skip:,}{undone_txt}\n\n저장되었습니다:\n{out_path}")
+            f"성공 {ok:,}건 / 실패 {fail:,}건 / 건너뜀 {skip:,}{undone_txt}{extra}"
+            f"\n\n저장되었습니다:\n{out_path}")
 
     def run_layers(self, path, ext, sheet, enc, raw, sel, opts, api_key, domain, workers):
         start_row = sel["start_row"]; prefix = sel.get("prefix", "")

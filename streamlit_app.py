@@ -217,20 +217,69 @@ def parse_bonbu(pnu):
     return None, None
 
 
+# ---------- 산(임야) 지번 처리 ----------
+# 토지대장은 산 여부가 지번이 아니라 '대장구분' 열에 따로 있다. 이걸 안 보면
+# 산 지번을 일반 지번으로 조회해 실패하거나, 같은 번호의 일반 필지에 조용히 잘못 매칭된다.
+SAN_HEAD_KEYS = ("대장구분", "산구분", "산여부", "지적구분", "대장종류", "토지구분")
+SAN_VALUES = {"산", "일반", "임야", "토지", "임야대장", "토지대장"}
+_SAN_RE = re.compile(r"(^|\s)산\s*\d")
+
+
+def is_san_value(v):
+    """대장구분·산여부 셀이 '산(임야대장)'을 뜻하는지.
+    '산'·'임야'·'Y'·코드 '2' 를 산으로 본다('일반'·'토지'·'1' 은 아님)."""
+    s = str(v or "").strip()
+    if not s:
+        return False
+    if s in ("2", "Y", "y"):
+        return True
+    return ("산" in s) or ("임야" in s)
+
+
+def addr_is_san(addr):
+    """주소 문자열이 산 지번인지('… 산 24-4')."""
+    return bool(_SAN_RE.search(str(addr or "")))
+
+
+def _jibun_text(jibun_raw, bon_raw, bu_raw, kind, san_flag):
+    """지번 문자열을 만든다. san_flag(대장구분 열)가 참이면 '산 ' 을 붙인다."""
+    if kind == "cell":
+        core = str(jibun_raw or "").strip()
+        if not core:
+            return ""
+        already = core.replace(" ", "").startswith("산")
+        return core if already else (f"산 {core}" if san_flag else core)
+    is_san = str(bon_raw or "").replace(" ", "").startswith("산") or san_flag
+    bon = "".join(ch for ch in str(bon_raw or "") if ch.isdigit())
+    bu = "".join(ch for ch in str(bu_raw or "") if ch.isdigit())
+    core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
+    return (f"산 {core}" if (is_san and core) else core)
+
+
+def detect_san_col(grid, start_row):
+    """대장구분(산/일반) 열 자동 추정. 제목 → 값 순으로 본다."""
+    max_r = min(n_rows(grid), 300); max_c = min(n_cols(grid), MAX_COLS)
+    for c in range(1, max_c + 1):
+        for hr in range(1, min(start_row, max_r + 1)):
+            if any(k in cell_str(grid, hr, c) for k in SAN_HEAD_KEYS):
+                return c
+    for c in range(1, max_c + 1):   # 값 기반: 산/일반 만 나오는 열
+        vals = [cell_str(grid, r, c) for r in range(start_row, min(start_row + 30, max_r + 1))]
+        vals = [v for v in vals if v]
+        if len(vals) >= 5 and all(v in SAN_VALUES for v in vals) and any(v in ("산", "임야") for v in vals):
+            return c
+    return None
+
+
 def build_address(grid, r, sel):
     if sel["kind"] == "full":
         return cell_str(grid, r, sel.get("addr_col"))
     prefix = " ".join(p for p in (cell_str(grid, r, c) for c in sel["admin_cols"]) if p).strip()
-    if sel["jibun_kind"] == "cell":
-        j = cell_str(grid, r, sel.get("jibun_col"))
-    else:
-        bon_raw = cell_str(grid, r, sel.get("bon_col"))
-        bu_raw = cell_str(grid, r, sel.get("bu_col"))
-        is_san = bon_raw.replace(" ", "").startswith("산")
-        bon = "".join(ch for ch in bon_raw if ch.isdigit())
-        bu = "".join(ch for ch in bu_raw if ch.isdigit())
-        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
-        j = (f"산 {core}" if is_san else core)
+    san_flag = is_san_value(cell_str(grid, r, sel.get("san_col"))) if sel.get("san_col") else False
+    j = _jibun_text(cell_str(grid, r, sel.get("jibun_col")),
+                    cell_str(grid, r, sel.get("bon_col")),
+                    cell_str(grid, r, sel.get("bu_col")),
+                    sel["jibun_kind"], san_flag)
     return f"{prefix} {j}".strip()
 
 
@@ -250,16 +299,11 @@ def build_address_row(row, sel):
     if sel["kind"] == "full":
         return _row_cell(row, sel.get("addr_col"))
     prefix = " ".join(p for p in (_row_cell(row, c) for c in sel["admin_cols"]) if p).strip()
-    if sel["jibun_kind"] == "cell":
-        j = _row_cell(row, sel.get("jibun_col"))
-    else:
-        bon_raw = _row_cell(row, sel.get("bon_col"))
-        bu_raw = _row_cell(row, sel.get("bu_col"))
-        is_san = bon_raw.replace(" ", "").startswith("산")
-        bon = "".join(ch for ch in bon_raw if ch.isdigit())
-        bu = "".join(ch for ch in bu_raw if ch.isdigit())
-        core = f"{bon}-{bu}" if (bon and bu and bu != "0") else bon
-        j = (f"산 {core}" if is_san else core)
+    san_flag = is_san_value(_row_cell(row, sel.get("san_col"))) if sel.get("san_col") else False
+    j = _jibun_text(_row_cell(row, sel.get("jibun_col")),
+                    _row_cell(row, sel.get("bon_col")),
+                    _row_cell(row, sel.get("bu_col")),
+                    sel["jibun_kind"], san_flag)
     return f"{prefix} {j}".strip()
 
 
@@ -290,15 +334,18 @@ def detect_layout(grid):
             if v and any(v.startswith(s) for s in SIDO):
                 hits.setdefault(c, []).append((r, v))
     if not hits:
-        return {"start_row": 2, "mode": "split", "cols": [1]}
+        return {"start_row": 2, "mode": "split", "cols": [1], "san_col": detect_san_col(grid, 2)}
     sido_col = max(hits, key=lambda c: len(hits[c]))
     start_row = min(r for r, _ in hits[sido_col])
     samples = [v for _, v in hits[sido_col]]
+    san_col = detect_san_col(grid, start_row)
     if any((" " in v and any(ch.isdigit() for ch in v)) for v in samples):
-        return {"start_row": start_row, "mode": "single", "cols": [sido_col]}
+        return {"start_row": start_row, "mode": "single", "cols": [sido_col], "san_col": san_col}
     jibun_re = re.compile(r"^산?\d+(-\d+)?$")
     cols = [sido_col]; c = sido_col + 1
     while c <= max_c and len(cols) < 6:
+        if c == san_col:        # 대장구분은 주소 글자가 아니라 산 표기용 → 주소 열에서 제외
+            c += 1; continue
         vals = [cell_str(grid, rr, c) for rr in range(start_row, min(start_row + 8, max_r + 1))]
         vals = [v for v in vals if v]
         if not vals:
@@ -307,7 +354,8 @@ def detect_layout(grid):
         if sum(1 for v in vals if jibun_re.match(v.replace(" ", ""))) >= max(1, len(vals) // 2):
             break
         c += 1
-    return {"start_row": start_row, "mode": "split", "cols": cols}
+    return {"start_row": start_row, "mode": "split",
+            "cols": [x for x in cols if x != san_col], "san_col": san_col}
 
 
 def geocode(addr, api_key, crs="EPSG:4326", retries=3):
@@ -576,6 +624,19 @@ if uploaded:
                 sel["bon_col"] = o2i[c1.selectbox("본번 열", opts)]
                 sel["bu_col"] = o2i[c2.selectbox("부번 열", opts)]
 
+        # 대장구분(산) 열 — 토지대장처럼 산 여부가 지번이 아니라 따로 있는 파일에 필수.
+        # 지정하지 않으면 산 지번이 실패하거나 같은 번호의 일반 필지에 조용히 잘못 매칭된다.
+        san_dflt = i2o.get(det.get("san_col"), "(없음)")
+        san_label = st.selectbox(
+            "대장구분(산 여부) 열 — 선택", opts, index=opts.index(san_dflt),
+            help="값이 '산'·'임야'·'Y'·'2' 이면 지번 앞에 '산' 을 붙여 조회합니다. "
+                 "토지대장처럼 산 여부가 별도 열에 있으면 반드시 지정하세요. "
+                 "지정하지 않으면 산 지번이 실패하거나 같은 번호의 일반 필지에 잘못 매칭됩니다.")
+        sel["san_col"] = o2i[san_label]
+        if sel["san_col"]:
+            st.caption("✅ 대장구분 열을 씁니다 — 산 지번은 '산 24-4' 형태로 조회하고, "
+                       "결과 PNU 11번째 자리로 산/일반을 교차 검증합니다.")
+
         prefix_common = st.text_input(
             "주소 앞에 공통으로 붙일 내용 (선택)", value="",
             placeholder="예: 전북특별자치도 — 데이터에 시도가 빠져 있을 때만",
@@ -617,8 +678,16 @@ if uploaded:
             st.stop()
 
         # (2) 한 주소가 필요로 하는 모든 조회(지오코딩+필지)를 한 작업으로 묶는다
+        san_check = bool(sel.get("san_col"))
+
         def work(addr):
             pnu, x, y, refined, status = geocode(addr, api_key, crs)
+            # 산/일반 교차 검증: 대장구분을 아는 경우, 지오코더가 반대쪽 필지를 물어오면 버린다.
+            # (PNU 11번째 자리 1=일반·2=산. 산 24-4 를 일반 24-4 로 매칭해 주는 조용한 오답을 막는다)
+            if san_check and status == "OK" and pnu and len(pnu) == 19:
+                if pnu[10] != ("2" if addr_is_san(addr) else "1"):
+                    pnu = x = y = refined = None
+                    status = "산일반불일치"
             item = {"addr": addr, "status": status, "pnu": pnu, "x": x, "y": y, "refined": refined}
             need_parcel = ((func.startswith("①") and want_jiga) or
                            (func.startswith("③") and want_pg))
