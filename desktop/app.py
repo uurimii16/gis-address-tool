@@ -292,8 +292,16 @@ def pnu_from_parts(code_val, bon, bu, daejang_val=None):
         return ""
     if flag not in ("1", "2"):
         flag = "1"
-    mn = "".join(c for c in str(bon or "") if c.isdigit()).zfill(4)
+    mn_raw = "".join(c for c in str(bon or "") if c.isdigit())
+    # 본번이 없거나 0이면 PNU 를 만들지 않는다. 0000 으로 채우면 19자리가 다 차서
+    # 정상처럼 보이는 가짜 PNU 가 조용히 섞인다(합계행·빈 행·머리글 잔재에서 잘 생긴다).
+    # 지번의 본번은 1 부터 시작한다. 부번 0000 은 정상이다('227' 처럼 부번 없는 지번).
+    if not mn_raw or int(mn_raw) == 0:
+        return ""
+    mn = mn_raw.zfill(4)
     sb = "".join(c for c in str(bu or "") if c.isdigit()).zfill(4)
+    if len(mn) > 4 or len(sb) > 4:      # 5자리 이상은 지번이 아니다 → 잘라 붙이지 않는다
+        return ""
     return bjd + flag + mn + sb
 
 
