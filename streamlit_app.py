@@ -17,6 +17,11 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
+# 배포 확인용 버전 도장. Streamlit 화면은 웹소켓으로 그려져 HTML 만으로는 어떤 코드가
+# 떠 있는지 알 수 없다 → 화면에 직접 찍어 두고, 재배포 후 이 값이 바뀌었는지로 확인한다.
+# 코드를 고칠 때마다 날짜를 올릴 것.
+APP_VERSION = "v2026-07-29 (산 지번 교차검증 · 토지대장 열 자동인식)"
+
 GEOCODE_URL = "https://api.vworld.kr/req/address"
 DATA_URL = "https://api.vworld.kr/req/data"
 
@@ -492,7 +497,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 """, unsafe_allow_html=True)
 
 st.title("🌐 GIS 주소 변환기")
-st.caption("VWorld 기반 · 주소를 PNU·좌표·지도 레이어로 일괄 변환합니다")
+st.caption(f"VWorld 기반 · 주소를 PNU·좌표·지도 레이어로 일괄 변환합니다　·　{APP_VERSION}")
 
 with st.expander("ℹ️  사용 방법 (처음이라면 펼쳐 보세요)", expanded=False):
     st.markdown(
