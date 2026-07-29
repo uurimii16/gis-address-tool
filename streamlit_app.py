@@ -223,6 +223,8 @@ def parse_bonbu(pnu):
 SAN_HEAD_KEYS = ("대장구분", "산구분", "산여부", "지적구분", "대장종류", "토지구분")
 SAN_VALUES = {"산", "일반", "임야", "토지", "임야대장", "토지대장"}
 _SAN_RE = re.compile(r"(^|\s)산\s*\d")
+# 앞부분 행에서 값이 비어 있어도 주소 구성 열로 인정할 제목들
+ADDR_UNIT_HEADS = {"리", "동", "읍", "면", "읍면동", "법정동", "행정동", "동리", "법정리", "리명"}
 
 
 def is_san_value(v):
@@ -340,7 +342,9 @@ def detect_layout(grid):
     samples = [v for _, v in hits[sido_col]]
     san_col = detect_san_col(grid, start_row)
     if any((" " in v and any(ch.isdigit() for ch in v)) for v in samples):
-        return {"start_row": start_row, "mode": "single", "cols": [sido_col], "san_col": san_col}
+        return {"start_row": start_row, "mode": "single", "cols": [sido_col], "san_col": san_col,
+                "bon_col": None, "bu_col": None}
+    header_row = start_row - 1
     jibun_re = re.compile(r"^산?\d+(-\d+)?$")
     cols = [sido_col]; c = sido_col + 1
     while c <= max_c and len(cols) < 6:
@@ -349,13 +353,26 @@ def detect_layout(grid):
         vals = [cell_str(grid, rr, c) for rr in range(start_row, min(start_row + 8, max_r + 1))]
         vals = [v for v in vals if v]
         if not vals:
+            # 앞부분만 비어 있는 '리' 같은 열은 제목을 보고 살린다.
+            # (동 지역이 먼저 나오는 토지대장은 '리' 열이 한참 아래에서야 채워진다)
+            if cell_str(grid, header_row, c).strip() in ADDR_UNIT_HEADS and len(cols) < 5:
+                cols.append(c); c += 1; continue
             break
         cols.append(c)
         if sum(1 for v in vals if jibun_re.match(v.replace(" ", ""))) >= max(1, len(vals) // 2):
             break
         c += 1
+
+    bon_col = bu_col = None      # 본번·부번이 따로 있으면 '분리' 모드로 열어 준다
+    for cc in range(1, max_c + 1):
+        h = cell_str(grid, header_row, cc)
+        if bon_col is None and "본번" in h:
+            bon_col = cc
+        if bu_col is None and "부번" in h:
+            bu_col = cc
     return {"start_row": start_row, "mode": "split",
-            "cols": [x for x in cols if x != san_col], "san_col": san_col}
+            "cols": [x for x in cols if x != san_col], "san_col": san_col,
+            "bon_col": bon_col, "bu_col": bu_col}
 
 
 def geocode(addr, api_key, crs="EPSG:4326", retries=3):
@@ -602,6 +619,9 @@ if uploaded:
             sel = {"start_row": int(start_row), "kind": "full", "addr_col": o2i[addr_label]}
         else:
             # '한 칸 전체주소'로 감지된 경우엔 그 열을 구성1 기본값으로 넣어 준다(하이브리드 대응)
+            # cols 의 마지막은 지번(또는 본번) 열이므로 주소 구성 열에서 뺀다 — 안 빼면
+            # '배미동 55 55-16' 처럼 본번이 주소에 한 번 더 붙는다.
+            has_bonbu = bool(det.get("bon_col") and det.get("bu_col"))
             admin_default = det["cols"][:-1] if det["mode"] == "split" else det["cols"]
             jibun_default = det["cols"][-1] if det["mode"] == "split" else None
             st.markdown("**주소 구성 열** — 큰 단위 → 작은 단위 순서 (예: 시도·시군구·읍면동·리)")
@@ -613,7 +633,8 @@ if uploaded:
                 lab = cc[i % 3].selectbox(f"구성 {i+1}", opts, index=opts.index(dflt), key=f"adm{i}_{sig}")
                 if o2i[lab]:
                     admin_cols.append(o2i[lab])
-            jkind = st.radio("지번 형태", ["한 칸 (71-2)", "본번·부번 분리"], horizontal=True)
+            jkind = st.radio("지번 형태", ["한 칸 (71-2)", "본번·부번 분리"], horizontal=True,
+                             index=1 if has_bonbu else 0)
             sel = {"start_row": int(start_row), "kind": "split", "admin_cols": admin_cols,
                    "jibun_kind": "cell" if jkind.startswith("한") else "bonbu"}
             if sel["jibun_kind"] == "cell":
@@ -621,8 +642,10 @@ if uploaded:
                 sel["jibun_col"] = o2i[st.selectbox("지번 열", opts, index=opts.index(dflt))]
             else:
                 c1, c2 = st.columns(2)
-                sel["bon_col"] = o2i[c1.selectbox("본번 열", opts)]
-                sel["bu_col"] = o2i[c2.selectbox("부번 열", opts)]
+                bdf = i2o.get(det.get("bon_col"), "(없음)")
+                udf = i2o.get(det.get("bu_col"), "(없음)")
+                sel["bon_col"] = o2i[c1.selectbox("본번 열", opts, index=opts.index(bdf))]
+                sel["bu_col"] = o2i[c2.selectbox("부번 열", opts, index=opts.index(udf))]
 
         # 대장구분(산) 열 — 토지대장처럼 산 여부가 지번이 아니라 따로 있는 파일에 필수.
         # 지정하지 않으면 산 지번이 실패하거나 같은 번호의 일반 필지에 조용히 잘못 매칭된다.
