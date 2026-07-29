@@ -37,14 +37,21 @@
    - ⚠ 같은 화면에서 **"카카오맵" 제품을 반드시 활성화**하세요. 안 하면 403 오류가 납니다.
 3. (선택) 필지·공시지가를 쓰거나 카카오 실패분을 보완하려면 **🔑 VWorld 인증키** 도 함께 넣으세요.
    - 옆의 **vworld.kr 열기** 버튼으로 무료 발급 (활용 API "2D 데이터 API" 체크, 사이트 URL `http://localhost`).
-4. 끝. 키는 자동으로 `config.txt` 에 저장돼, **다음에 켜면 그대로 기억**됩니다. 파일을 직접 편집할 필요 없어요.
+4. 끝. 키는 자동으로 저장돼 **다음에 켜면 그대로 기억**됩니다. 파일을 직접 편집할 필요 없어요.
+
+### 인증키가 저장되는 곳
+`%APPDATA%\GIS주소변환기\config.txt` (탐색기 주소창에 `%APPDATA%\GIS주소변환기` 붙여넣으면 열립니다).
+
+**exe 옆이 아니라 사용자 폴더에 저장**하므로 — 새 버전 exe 로 바꿔도, 폴더를 옮겨도 **키를 다시 넣을 필요가 없습니다.** Program Files 처럼 쓰기 막힌 곳에 둬도 저장돼요.
+
+> exe 옆에 이미 `config.txt` 가 있으면 그쪽을 그대로 씁니다(기존 사용자·USB 포터블 사용을 깨지 않기 위해). USB로 들고 다니며 쓰고 싶으면 exe 옆에 빈 `config.txt` 를 만들어 두세요.
 
 > 각자 자기 키를 앱에 한 번 넣으면 됩니다. `config.txt` 를 손으로 만들 필요가 없어요(고급 사용자는 편집해도 됨 — 아래 `config.txt.example` 참고).
 
 ## 배포 (다른 사람에게 줄 때)
 - **`주소PNU변환기.exe` 파일 하나만** 주면 됩니다. 받은 사람은 실행 후 자기 인증키를 칸에 넣으면 끝.
 - ⚠️ **내 키가 든 `config.txt` 는 함께 주지 마세요** (남이 내 사용량을 씀). exe 만 주면 상대는 자기 키를 넣습니다.
-- exe 를 처음 실행하면 같은 폴더에 `config.txt` 가 자동 생성됩니다(쓰기 가능한 위치 — 바탕화면/다운로드 폴더 권장, Program Files 같은 곳은 피하기).
+- exe 를 처음 실행하면 `%APPDATA%\GIS주소변환기\config.txt` 가 자동 생성됩니다. 받는 사람은 앱에서 자기 키를 한 번 넣으면 끝이고, 이후 새 버전 exe 를 줘도 다시 넣을 필요가 없습니다.
 
 ## 소스로 실행
 ```bash
@@ -58,7 +65,7 @@ pip install -r requirements.txt
 python -m PyInstaller --noconfirm --onefile --windowed --icon=icon.ico ^
   --add-data "icon.ico;." --collect-all tkinterdnd2 --distpath dist --name 주소PNU변환기 app.py
 ```
-- 빌드 결과: `dist/주소PNU변환기.exe`. 실행 시 같은 폴더에 `config.txt` 가 있어야 합니다(없으면 자동 생성 후 키 입력 안내).
+- 빌드 결과: `dist/주소PNU변환기.exe`. 설정은 `%APPDATA%\GIS주소변환기\config.txt` 에 자동 생성됩니다(exe 옆에 `config.txt` 가 있으면 그쪽 우선).
 - 기존 exe 가 **실행 중이면 잠겨서 빌드 실패** → 창을 닫거나 `--distpath` 를 다른 폴더로.
 
 ## 토지대장처럼 "대장구분(산/일반)" 열이 있는 파일 ⚠️ 중요

@@ -89,15 +89,29 @@ FONT_PREFER = [
 PICK_TEXT = "📂  파일 선택 (.xlsx · .csv)  ·  또는 파일을 여기로 끌어다 놓기"
 
 DEFAULT_CONFIG = """# ===== 변환기 설정 =====
-# VWorld 인증키 (필수) — 각자 vworld.kr 에서 무료로 발급받아 붙여넣으세요.
+# 이 파일을 손으로 고칠 필요는 없어요. 앱 안에서 키를 넣고 [확인·저장]하면 여기에 저장됩니다.
+
+# ----- 엔진 -----
+# kakao  = 기본. 빠르고(초당 33건) 하루 10만건. PNU·좌표·도로명주소·건물명.
+# vworld = 느리고(초당 14건) 하루 4만건. 대신 필지 경계·공시지가는 이쪽만 됩니다.
+ENGINE=kakao
+
+# 카카오 REST API 키 (ENGINE=kakao 일 때 필요)
+# developers.kakao.com → 내 애플리케이션 → 앱 키 → REST API 키
+#  ※ 같은 화면에서 '카카오맵' 제품을 반드시 활성화하세요(안 하면 403 오류).
+KAKAO_KEY=여기에_카카오_REST_API_키_붙여넣기
+
+# VWorld 인증키 — 필지·공시지가를 쓰거나 카카오 실패분을 보완할 때 필요합니다.
+# 각자 vworld.kr 에서 무료로 발급받아 붙여넣으세요(활용 API에 '2D 데이터 API' 체크).
 API_KEY=여기에_VWorld_인증키_붙여넣기
 
 # 공시지가·필지 조회 시 데이터 API 도메인 (키 등록 URL과 동일하게)
 DOMAIN=localhost
 
-# 동시에 조회하는 개수 (많을수록 빠르지만 너무 크면 VWorld가 연결을 끊어 실패가 늘어요).
-# '통신실패'가 많으면 4 -> 3 으로 줄이고, 계속 안정적이면 6~8 로 올려 보세요.
-WORKERS=4
+# 동시에 조회하는 개수.
+# 카카오는 관대해서 10 정도까지 올려도 됩니다.
+# VWorld 는 너무 크면 연결을 끊어 실패가 늘어요 → 4~6, '통신실패'가 많으면 더 줄이세요.
+WORKERS=10
 """
 
 CRS_OPTIONS = {
@@ -156,8 +170,48 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
+APP_NAME = "GIS주소변환기"
+_cfg_path_cache = []
+
+
+def _user_config_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, APP_NAME)
+
+
 def config_path():
-    return os.path.join(app_dir(), "config.txt")
+    """설정(인증키) 파일 위치. 우선순위:
+      ① exe 옆에 config.txt 가 이미 있으면 그것 — 기존 사용자·USB 포터블 사용을 안 깬다.
+      ② 없으면 %APPDATA%\\GIS주소변환기\\config.txt.
+    ②가 기본인 이유: exe 옆에 두면 새 버전 exe 로 바꾸거나 폴더를 옮길 때마다 키가 사라지고,
+    Program Files 처럼 쓰기 막힌 곳에서는 아예 저장이 안 된다. 사용자당 한 번만 넣으면 끝나게 한다."""
+    if _cfg_path_cache:
+        return _cfg_path_cache[0]
+    beside = os.path.join(app_dir(), "config.txt")
+    if os.path.exists(beside):
+        p = beside
+    else:
+        d = _user_config_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, "config.txt")
+        except OSError:
+            p = beside   # %APPDATA% 를 못 만들면 예전 방식으로
+    _cfg_path_cache.append(p)
+    return p
+
+
+def read_config_text():
+    """config.txt 를 읽어 문자열로. 앱은 UTF-8로 쓰지만, 사용자가 메모장으로 열어 저장하면
+    CP949 가 되어 UTF-8 디코딩이 터진다(그러면 앱이 아예 안 켜짐) → 순서대로 시도한다."""
+    path = config_path()
+    raw = open(path, "rb").read()
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def load_config():
@@ -166,13 +220,12 @@ def load_config():
         with open(path, "w", encoding="utf-8") as f:
             f.write(DEFAULT_CONFIG)
     cfg = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            cfg[k.strip()] = v.strip()
+    for line in read_config_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip()
     return cfg
 
 
@@ -182,8 +235,7 @@ def set_config_value(key, value):
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write(DEFAULT_CONFIG)
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
+    lines = read_config_text().splitlines()
     found = False
     for i, line in enumerate(lines):
         s = line.strip()
